@@ -147,6 +147,7 @@ class HurricaneSimulation:
 
 
 
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -169,7 +170,7 @@ if __name__ == "__main__":
     sww_input = "Hurricane_steady_state_phase_2.sww"
     case_path = 'results/temp/' 
     base_resolution = 70000.0
-    finer_zone_resolution = 7000.0
+    finer_zone_resolution = [7000.0]
 
     TMS_OUTPUT_FOLDER = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/tms_files'
     radius = 100.0  
@@ -184,47 +185,57 @@ if __name__ == "__main__":
         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
     ]
 
-    # --- START OF 2-CYCLE LOOP ---
-    for i in range(1, 2):
-        if myid == 0:
-            print(f"\n" + "="*60)
-            print(f"STARTING CYCLE {i}")
-            print("="*60)
+    try:
+        # --- START OF 2-CYCLE LOOP ---
+        for i in range(len(finer_zone_resolution)):
+            if myid == 0:
+                print(f"\n" + "="*60)
+                print(f"STARTING CYCLE {i}: Resolution {finer_zone_resolution[i]}")
+                print("="*60)
 
-        # Unique output name for each cycle to prevent overwriting
-        sww_continue = os.path.join(case_path, f'Hurricane_cycle_{i}')
+            # Unique output name for each cycle
+            sww_continue = os.path.join(case_path, f'Hurricane_res_{finer_zone_resolution[i]}')
 
-        # Instantiate and Run Simulation (All processors participate)
-        sim = HurricaneSimulation(
-            myid, numprocs, topography_file, mesh_file, finer_zone_path,
-            sww_input, sww_continue, base_resolution, finer_zone_resolution,
-            TMS_OUTPUT_FOLDER, radius, gauges
-        )
-        
-        sim.setup_domain()
-        sim.setup_inlets()
-        sim.evolve()
-        
-        # CRITICAL: Wait for all ranks to finish writing partial files
-        barrier()
-
-        # ============================================================================
-        # FINALIZE AND MERGE OUTPUT (MASTER PROCESS ONLY)
-        # ============================================================================
-        if myid == 0:
-            print(f"Master: Merging partial files for Cycle {i}...")
-            
-            # Use the directory where partial files were saved
-            merged = merge_sww_files_parallel_parts(
-                directory=case_path,
-                output_name=f'merged/Hurricane_dynamics_cycle_{i}.sww',
-                delete_originals=True,
-                verbose=True
+            # Instantiate and Run Simulation
+            sim = HurricaneSimulation(
+                myid, numprocs, topography_file, mesh_file, finer_zone_path,
+                sww_input, sww_continue, base_resolution, finer_zone_resolution[i],
+                TMS_OUTPUT_FOLDER, radius, gauges
             )
-            print(f"Merged file created: {merged}")
-        
-        # Sync again before starting the next cycle
-        barrier()
+            
+            sim.setup_domain()
+            sim.setup_inlets()
+            sim.evolve()
+            
+            # Synchronize after evolution
+            barrier()
 
-    # Final cleanup after all cycles complete
-    finalize()
+            # Master process merges results
+            if myid == 0:
+                print(f"Master: Merging partial files for resolution {finer_zone_resolution[i]}...")
+                merge_sww_files_parallel_parts(
+                    directory=case_path,
+                    output_name=f'merged\Hurricane_dynamics_res_{finer_zone_resolution[i]}.sww',
+                    delete_originals=True,
+                    verbose=True
+                )
+            
+            # Final sync for current cycle before moving to the next
+            barrier()
+
+    except Exception as e:
+        if myid == 0:
+            print(f"\nCRITICAL ERROR in Cycle {i}: {e}")
+        # Re-raise error to let Slurm catch the non-zero exit code if desired
+        raise e
+
+    finally:
+        # Guaranteed cleanup for sbatch termination
+        if myid == 0:
+            print("\n" + "="*60)
+            print("ALL CYCLES COMPLETE - TERMINATING JOB")
+            print("="*60)
+        
+        barrier()   # Ensure all ranks reach this point
+        finalize()  # Cleanly close MPI communication
+        sys.exit(0) # Signal success to Slurm    
