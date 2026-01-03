@@ -4,7 +4,16 @@ import glob
 from netCDF4 import Dataset
 import numpy as np
 
-
+def get_subfolders(path):
+    # Check if the path actually exists first to avoid errors
+    if os.path.exists(path):
+        # os.listdir(path) gets everything (files and folders)
+        # os.path.isdir checks if the item is specifically a directory
+        subfolders = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
+        return subfolders
+    else:
+        print(f"Error: Path {path} does not exist.")
+        return []
 
 def get_sww_mesh_and_states(sww_path, last_index=-1, dry_threshold=0.025):
     """

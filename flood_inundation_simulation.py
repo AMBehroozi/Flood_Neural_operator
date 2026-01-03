@@ -8,6 +8,8 @@ from anuga.parallel import distribute, barrier, finalize
 from helpers.helper import *
 import rasterio
 from scipy.interpolate import griddata
+import datetime
+
 
 class HurricaneSimulation:
     def __init__(self, myid, numprocs, topography_file, mesh_file, finer_zone_path, 
@@ -139,12 +141,10 @@ class HurricaneSimulation:
             print(f"Starting Evolution. Final time: {self.final_time_seconds/3600:.2f} hours")
         
         for t in self.domain.evolve(yieldstep=yieldstep_factor * self.DAY, finaltime=self.final_time_seconds):
-        # for t in self.domain.evolve(yieldstep=yieldstep_factor * self.DAY, finaltime=2 * self.DAY):
+        # for t in self.domain.evolve(yieldstep=0.1 * self.DAY, finaltime=1 * self.DAY):
             if self.myid == 0:
                 self.domain.print_timestepping_statistics()
                 print(f"   Current Progress: {t / self.DAY:.2f} days")
-
-
 
 
 
@@ -168,11 +168,12 @@ if __name__ == "__main__":
     mesh_file = 'mesh/hurricane_domain_final_backup.msh'
     finer_zone_path = 'finer_zone.csv'
     sww_input = "Hurricane_steady_state_phase_2.sww"
-    case_path = 'results/temp/' 
-    base_resolution = 70000.0
-    finer_zone_resolution = [7000.0]
 
-    TMS_OUTPUT_FOLDER = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/tms_files'
+    base_resolution = 70000.0
+    finer_zone_resolution = 7000
+
+
+    
     radius = 100.0  
     gauges = [
         {"id": "Bc1_8791413",  "x": 203142.27, "y": 3922226.29},
@@ -185,47 +186,76 @@ if __name__ == "__main__":
         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
     ]
 
+
+
+
+    group = 'group_000'  # group_XXX
+    group_path = 'scenario_groups/' + group
+    senaio_list = get_subfolders(group_path)
+    
+    
+     
+
+    # Define the log file path in the root directory
+    log_file_path = f"simulation_progress_{group}.log"
+
     try:
-        # --- START OF 2-CYCLE LOOP ---
-        for i in range(len(finer_zone_resolution)):
-            if myid == 0:
-                print(f"\n" + "="*60)
-                print(f"STARTING CYCLE {i}: Resolution {finer_zone_resolution[i]}")
-                print("="*60)
+        # --- START OF SCENARIO LOOP ---
+        for senario in senaio_list:
+
+            TMS_OUTPUT_FOLDER = os.path.join(group_path, senario, 'tms_files')
+            case_path = os.path.join(group_path, senario)
 
             # Unique output name for each cycle
-            sww_continue = os.path.join(case_path, f'Hurricane_res_{finer_zone_resolution[i]}')
+            sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
 
-            # Instantiate and Run Simulation
+            if myid == 0:
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                start_msg = f"[{timestamp}] STARTING: {group} - {senario}\nsww_continue: {sww_continue}\nTMS_OUTPUT_FOLDER: {TMS_OUTPUT_FOLDER}\ncase_path: {case_path}"
+                print(f"\n" + "="*60 + f"\n{start_msg}\n" + "="*60)
+                
+                # Write to log file immediately [cite: 1422, 1426]
+                with open(log_file_path, "a") as log:
+                    log.write(start_msg + "\n")
+
+
+            # Instantiate and Run Simulation [cite: 160, 210]
             sim = HurricaneSimulation(
                 myid, numprocs, topography_file, mesh_file, finer_zone_path,
-                sww_input, sww_continue, base_resolution, finer_zone_resolution[i],
+                sww_input, sww_continue, base_resolution, finer_zone_resolution,
                 TMS_OUTPUT_FOLDER, radius, gauges
             )
             
             sim.setup_domain()
             sim.setup_inlets()
-            sim.evolve()
+            sim.evolve() # Evolution process [cite: 1810, 1811]
             
-            # Synchronize after evolution
+            # Synchronize after evolution [cite: 187, 308]
             barrier()
 
-            # Master process merges results
+            # Master process merges results and updates log
             if myid == 0:
-                print(f"Master: Merging partial files for resolution {finer_zone_resolution[i]}...")
+                print(f"Master: Merging partial files for {group}_{senario}...")
                 merge_sww_files_parallel_parts(
                     directory=case_path,
-                    output_name=f'merged\Hurricane_dynamics_res_{finer_zone_resolution[i]}.sww',
+                    output_name=f'Hurricane_{group}_{senario}_merged.sww',
                     delete_originals=True,
                     verbose=True
                 )
+                
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                end_msg = f"[{timestamp}] COMPLETED & MERGED: {group} - {senario}"
+                print(end_msg)
+                
+                # Append completion status to log
+                with open(log_file_path, "a") as log:
+                    log.write(end_msg + "\n\n")
             
             # Final sync for current cycle before moving to the next
             barrier()
-
     except Exception as e:
         if myid == 0:
-            print(f"\nCRITICAL ERROR in Cycle {i}: {e}")
+            print(f"\nCRITICAL ERROR in {group}_{senario}")
         # Re-raise error to let Slurm catch the non-zero exit code if desired
         raise e
 
@@ -239,3 +269,52 @@ if __name__ == "__main__":
         barrier()   # Ensure all ranks reach this point
         finalize()  # Cleanly close MPI communication
         sys.exit(0) # Signal success to Slurm    
+
+
+
+
+
+
+
+
+
+        # # --- START OF 2-CYCLE LOOP ---
+        # for senario in senaio_list:
+        #     if myid == 0:
+        #         print(f"\n" + "="*60)
+        #         print(f"STARTING {group} - {senario}")
+        #         print("="*60)
+
+        #     TMS_OUTPUT_FOLDER =group_path + '/' + senario + '/tms_files'
+        #     case_path = group_path + '/' + senario
+
+        #     # Unique output name for each cycle
+        #     sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
+
+        #     # Instantiate and Run Simulation
+        #     sim = HurricaneSimulation(
+        #         myid, numprocs, topography_file, mesh_file, finer_zone_path,
+        #         sww_input, sww_continue, base_resolution, finer_zone_resolution,
+        #         TMS_OUTPUT_FOLDER, radius, gauges
+        #     )
+            
+        #     sim.setup_domain()
+        #     sim.setup_inlets()
+        #     sim.evolve()
+            
+        #     # Synchronize after evolution
+        #     barrier()
+
+        #     # Master process merges results
+        #     if myid == 0:
+        #         print(f"Master: Merging partial files for resolution {group}_{senario}...")
+        #         merge_sww_files_parallel_parts(
+        #             directory=case_path,
+        #             output_name=f'Hurricane_{group}_{senario}_merged' + '.sww',
+        #             delete_originals=True,
+        #             verbose=True
+        #         )
+            
+        #     # Final sync for current cycle before moving to the next
+        #     barrier()
+
