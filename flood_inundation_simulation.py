@@ -10,6 +10,22 @@ import rasterio
 from scipy.interpolate import griddata
 import datetime
 from tqdm import tqdm
+import signal
+import traceback
+import datetime
+import sys
+import os
+
+
+
+
+class TimeoutException(Exception):
+    """Raised when a scenario times out"""
+    pass
+
+def timeout_handler(signum, frame):
+    """Signal handler for timeout"""
+    raise TimeoutException("Scenario execution timeout")
 
 
 class HurricaneSimulation:
@@ -33,7 +49,7 @@ class HurricaneSimulation:
         self.domain = None
         self.final_time_seconds = 0.0
         self.DAY = 24 * 3600
-        self.threshold = 0.025
+        self.threshold = 0.005
 
     def setup_domain(self):
         """Orchestrates the preparation and distribution of the domain."""
@@ -136,58 +152,33 @@ class HurricaneSimulation:
         
         self.final_time_seconds = float(max_time)
 
+
     def evolve(self, log_file_path, yieldstep_factor=0.25):
-        """Runs the simulation evolution loop."""
+        """Runs the simulation evolution loop with per-iteration timeout."""
         if self.myid == 0:
             print(f"Starting Evolution. Final time: {self.final_time_seconds/3600:.2f} hours")
         
-        for t in self.domain.evolve(yieldstep=yieldstep_factor * self.DAY, finaltime=self.final_time_seconds):
-        # for t in self.domain.evolve(yieldstep=0.1 * self.DAY, finaltime=1 * self.DAY):
+        iteration_timeout = 900  # 15 minutes per iteration
+        
+        try:
+            for t in self.domain.evolve(yieldstep=yieldstep_factor * self.DAY, finaltime=self.final_time_seconds):
+                
+                # Reset timeout for EACH iteration (critical!)
+                signal.alarm(iteration_timeout)
+                
+                if self.myid == 0:
+                    with open(log_file_path, "a") as log:
+                        progress_percent = (t / self.final_time_seconds) * 100
+                        now = datetime.datetime.now()
+                        log.write(f'time: {t:.2f}s ({t/self.DAY:.2f} days, {progress_percent:.1f}%) -- {now.strftime("%d/%m/%y %H:%M")}\n')
+                    self.domain.print_timestepping_statistics()
+                    print(f"   Current Progress: {t / self.DAY:.2f} days")
+                
+        except Exception as e:
             if self.myid == 0:
-                with open(log_file_path, "a") as log:
-                    progress_percent = (t / self.final_time_seconds) * 100
-                    now = datetime.datetime.now()
-                    log.write(f'time: {t:.2f}s ({t/self.DAY:.2f} days, {progress_percent:.1f}%) -- {now.strftime("%d/%m/%y %H:%M")}\n')                
-                self.domain.print_timestepping_statistics()
-                print(f"   Current Progress: {t / self.DAY:.2f} days")
+                print(f"Evolution failed at rank {self.myid}: {str(e)}")
+            raise
 
-
-    # def evolve(self, log_file_path, yieldstep_factor=0.25):
-    #     """Runs the simulation evolution loop with simple progress bar."""
-    #     if self.myid == 0:
-    #         start_msg = f"Starting Evolution. Final time: {self.final_time_seconds/3600:.2f} hours"
-    #         print(start_msg)
-            
-    #         with open(log_file_path, "a") as log:
-    #             log.write(start_msg + "\n")
-            
-    #         # Calculate total steps
-    #         yieldstep = yieldstep_factor * self.DAY
-    #         total_steps = int(self.final_time_seconds / yieldstep)
-            
-    #         # Create simple progress bar
-    #         pbar = tqdm(total=total_steps, desc="Evolution", unit="step")
-        
-    #     for t in self.domain.evolve(yieldstep=yieldstep_factor * self.DAY, finaltime=self.final_time_seconds):
-    #         if self.myid == 0:
-    #             # Update progress bar
-    #             pbar.update(1)
-                
-    #             # Log progress to file
-    #             progress_percent = (t / self.final_time_seconds) * 100
-    #             with open(log_file_path, "a") as log:
-    #                 log.write(f'time: {t:.2f}s ({t/self.DAY:.2f} days, {progress_percent:.1f}%)\n')
-                
-    #             # Print timestep statistics
-    #             self.domain.print_timestepping_statistics()
-    #             print(f"   Current Progress: {t / self.DAY:.2f} days")
-        
-    #     if self.myid == 0:
-    #         pbar.close()
-    #         end_msg = "Evolution Complete"
-    #         print(end_msg)
-    #         with open(log_file_path, "a") as log:
-    #             log.write(end_msg + "\n\n")
 
 # ============================================================================
 # MAIN EXECUTION
@@ -210,7 +201,7 @@ if __name__ == "__main__":
     data_dir = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/DEM10/'
     topography_file = os.path.join(data_dir, 'DM10GLDN2.asc')
     mesh_file = 'mesh/hurricane_domain_final_backup.msh'
-    finer_zone_path = 'finer_zone.csv'
+    finer_zone_path = 'finer_zone2.csv'
     sww_input = "Hurricane_steady_state_phase_2.sww"
 
     base_resolution = 70000.0
@@ -228,7 +219,7 @@ if __name__ == "__main__":
         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
     ]
 
-    group = 'group_003'  # group_XXX
+    group = 'group_024'  # group_XXX
     group_path = 'scenario_groups/' + group
     senaio_list = get_subfolders(group_path)
 
@@ -391,359 +382,4 @@ if __name__ == "__main__":
         MPI.Finalize()
     
     sys.exit(0)
-
-
-
-# # ============================================================================
-# # MAIN EXECUTION
-# # ============================================================================
-# if __name__ == "__main__":
-#     # MPI Initialization
-#     try:
-#         from mpi4py import MPI
-#         comm = MPI.COMM_WORLD
-#         myid = comm.Get_rank()
-#         numprocs = comm.Get_size()
-#     except ImportError:
-#         myid = 0
-#         numprocs = 1
-
-#     # Raw Input Variables
-#     data_dir = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/DEM10/'
-#     topography_file = os.path.join(data_dir, 'DM10GLDN2.asc')
-#     mesh_file = 'mesh/hurricane_domain_final_backup.msh'
-#     finer_zone_path = 'finer_zone.csv'
-#     sww_input = "Hurricane_steady_state_phase_2.sww"
-
-#     base_resolution = 70000.0
-#     finer_zone_resolution = 7000
-
-#     radius = 100.0  
-#     gauges = [
-#         {"id": "Bc1_8791413",  "x": 203142.27, "y": 3922226.29},
-#         {"id": "Bc2_8790751",  "x": 209767.46, "y": 3915832.46},
-#         {"id": "Bc3_8790719",  "x": 214258.80, "y": 3920627.66},
-#         {"id": "Bc4_8790801",  "x": 215750.40, "y": 3914499.44},
-#         {"id": "Bc5_8790519",  "x": 218575.49, "y": 3920699.28},
-#         {"id": "Bc6_8790559",  "x": 225078.15, "y": 3921002.98},
-#         {"id": "Bc7_11235707", "x": 227582.00, "y": 3915030.09},
-#         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
-#     ]
-
-#     group = 'group_004'  # group_XXX
-#     group_path = 'scenario_groups/' + group
-#     senaio_list = get_subfolders(group_path)
-
-#     # Define the log file path in the root directory
-#     log_file_path = f"simulation_progress_{group}.log"
-    
-#     # Track failed scenarios
-#     failed_scenarios = []
-#     successful_scenarios = []
-
-#     # --- START OF SCENARIO LOOP ---
-#     for senario in senaio_list:
-#         # Flag to track if this rank encountered an error (0=success, 1=error)
-#         error_occurred = 0
-        
-#         try:
-#             TMS_OUTPUT_FOLDER = os.path.join(group_path, senario, 'tms_files')
-#             case_path = os.path.join(group_path, senario)
-
-#             # Unique output name for each cycle
-#             sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
-
-#             if myid == 0:
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 start_msg = f"[{timestamp}] STARTING: {group} - {senario}\nsww_continue: {sww_continue}\nTMS_OUTPUT_FOLDER: {TMS_OUTPUT_FOLDER}\ncase_path: {case_path}"
-#                 print(f"\n" + "="*60 + f"\n{start_msg}\n" + "="*60)
-                
-#                 # Write to log file immediately
-#                 with open(log_file_path, "a") as log:
-#                     log.write(start_msg + "\n")
-
-#             # Instantiate and Run Simulation
-#             sim = HurricaneSimulation(
-#                 myid, numprocs, topography_file, mesh_file, finer_zone_path,
-#                 sww_input, sww_continue, base_resolution, finer_zone_resolution,
-#                 TMS_OUTPUT_FOLDER, radius, gauges
-#             )
-            
-#             sim.setup_domain()
-#             sim.setup_inlets()
-#             sim.evolve()
-            
-#         except Exception as e:
-#             # Mark that this rank had an error
-#             error_occurred = 1
-            
-#             if myid == 0:
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 error_msg = f"[{timestamp}] ERROR in rank {myid} for {group} - {senario}: {str(e)}"
-#                 print(f"\n{'!'*60}\n{error_msg}\n{'!'*60}")
-                
-#                 # Log the error
-#                 with open(log_file_path, "a") as log:
-#                     log.write(error_msg + "\n")
-#                     log.write(f"Traceback: {traceback.format_exc()}\n\n")
-        
-#         # Synchronize and check if ANY rank had an error
-#         if numprocs > 1:
-#             # Gather error flags from all ranks to rank 0
-#             all_errors = comm.gather(error_occurred, root=0)
-            
-#             # Rank 0 determines if any rank failed
-#             if myid == 0:
-#                 any_error = sum(all_errors) > 0
-#             else:
-#                 any_error = None
-            
-#             # Broadcast the decision to all ranks
-#             any_error = comm.bcast(any_error, root=0)
-#         else:
-#             any_error = error_occurred > 0
-        
-#         # All ranks now know if the scenario failed
-#         if any_error:
-#             if myid == 0:
-#                 print(f"Scenario {senario} failed on one or more ranks. Skipping to next scenario.")
-#                 failed_scenarios.append(senario)
-            
-#             # All ranks skip merging and continue to next scenario
-#             barrier()
-#             continue
-        
-#         # If we reach here, all ranks succeeded
-#         barrier()
-        
-#         # Master process merges results and updates log
-#         if myid == 0:
-#             print(f"Master: Merging partial files for {group}_{senario}...")
-#             try:
-#                 merge_sww_files_parallel_parts(
-#                     directory=case_path,
-#                     output_name=f'Hurricane_{group}_{senario}_merged.sww',
-#                     delete_originals=True,
-#                     verbose=True
-#                 )
-                
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 end_msg = f"[{timestamp}] COMPLETED & MERGED: {group} - {senario}"
-#                 print(end_msg)
-                
-#                 # Append completion status to log
-#                 with open(log_file_path, "a") as log:
-#                     log.write(end_msg + "\n\n")
-                
-#                 successful_scenarios.append(senario)
-#             except Exception as e:
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 error_msg = f"[{timestamp}] ERROR during merge for {group} - {senario}: {str(e)}"
-#                 print(error_msg)
-#                 with open(log_file_path, "a") as log:
-#                     log.write(error_msg + "\n\n")
-#                 failed_scenarios.append(senario)
-        
-#         # Final sync for current cycle before moving to the next
-#         barrier()
-
-#     # Final summary
-#     if myid == 0:
-#         print("\n" + "="*60)
-#         print("ALL CYCLES COMPLETE")
-#         print("="*60)
-#         print(f"Successful scenarios: {len(successful_scenarios)}/{len(senaio_list)}")
-#         print(f"Failed scenarios: {len(failed_scenarios)}/{len(senaio_list)}")
-        
-#         if failed_scenarios:
-#             print("\nFailed scenarios:")
-#             for fs in failed_scenarios:
-#                 print(f"  - {fs}")
-        
-#         # Write final summary to log
-#         with open(log_file_path, "a") as log:
-#             log.write("="*60 + "\n")
-#             log.write(f"FINAL SUMMARY - {group}\n")
-#             log.write(f"Successful: {len(successful_scenarios)}/{len(senaio_list)}\n")
-#             log.write(f"Failed: {len(failed_scenarios)}/{len(senaio_list)}\n")
-#             if failed_scenarios:
-#                 log.write("Failed scenarios: " + ", ".join(failed_scenarios) + "\n")
-#             log.write("="*60 + "\n")
-        
-#         print("="*60)
-    
-#     barrier()
-#     finalize()
-#     sys.exit(0)
-
-
-
-
-# # ============================================================================
-# # MAIN EXECUTION
-# # ============================================================================
-# if __name__ == "__main__":
-#     # MPI Initialization
-#     try:
-#         from mpi4py import MPI
-#         comm = MPI.COMM_WORLD
-#         myid = comm.Get_rank()
-#         numprocs = comm.Get_size()
-#     except ImportError:
-#         myid = 0
-#         numprocs = 1
-
-#     # Raw Input Variables
-#     data_dir = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/DEM10/'
-#     topography_file = os.path.join(data_dir, 'DM10GLDN2.asc')
-#     mesh_file = 'mesh/hurricane_domain_final_backup.msh'
-#     finer_zone_path = 'finer_zone.csv'
-#     sww_input = "Hurricane_steady_state_phase_2.sww"
-
-#     base_resolution = 70000.0
-#     finer_zone_resolution = 7000
-
-
-    
-#     radius = 100.0  
-#     gauges = [
-#         {"id": "Bc1_8791413",  "x": 203142.27, "y": 3922226.29},
-#         {"id": "Bc2_8790751",  "x": 209767.46, "y": 3915832.46},
-#         {"id": "Bc3_8790719",  "x": 214258.80, "y": 3920627.66},
-#         {"id": "Bc4_8790801",  "x": 215750.40, "y": 3914499.44},
-#         {"id": "Bc5_8790519",  "x": 218575.49, "y": 3920699.28},
-#         {"id": "Bc6_8790559",  "x": 225078.15, "y": 3921002.98},
-#         {"id": "Bc7_11235707", "x": 227582.00, "y": 3915030.09},
-#         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
-#     ]
-
-
-#     group = 'group_002'  # group_XXX
-#     group_path = 'scenario_groups/' + group
-#     senaio_list = get_subfolders(group_path)
-    
-    
-     
-
-#     # Define the log file path in the root directory
-#     log_file_path = f"simulation_progress_{group}.log"
-
-#     try:
-#         # --- START OF SCENARIO LOOP ---
-#         for senario in senaio_list:
-
-#             TMS_OUTPUT_FOLDER = os.path.join(group_path, senario, 'tms_files')
-#             case_path = os.path.join(group_path, senario)
-
-#             # Unique output name for each cycle
-#             sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
-
-#             if myid == 0:
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 start_msg = f"[{timestamp}] STARTING: {group} - {senario}\nsww_continue: {sww_continue}\nTMS_OUTPUT_FOLDER: {TMS_OUTPUT_FOLDER}\ncase_path: {case_path}"
-#                 print(f"\n" + "="*60 + f"\n{start_msg}\n" + "="*60)
-                
-#                 # Write to log file immediately [cite: 1422, 1426]
-#                 with open(log_file_path, "a") as log:
-#                     log.write(start_msg + "\n")
-
-
-#             # Instantiate and Run Simulation [cite: 160, 210]
-#             sim = HurricaneSimulation(
-#                 myid, numprocs, topography_file, mesh_file, finer_zone_path,
-#                 sww_input, sww_continue, base_resolution, finer_zone_resolution,
-#                 TMS_OUTPUT_FOLDER, radius, gauges
-#             )
-            
-#             sim.setup_domain()
-#             sim.setup_inlets()
-#             sim.evolve() # Evolution process [cite: 1810, 1811]
-            
-#             # Synchronize after evolution [cite: 187, 308]
-#             barrier()
-
-#             # Master process merges results and updates log
-#             if myid == 0:
-#                 print(f"Master: Merging partial files for {group}_{senario}...")
-#                 merge_sww_files_parallel_parts(
-#                     directory=case_path,
-#                     output_name=f'Hurricane_{group}_{senario}_merged.sww',
-#                     delete_originals=True,
-#                     verbose=True
-#                 )
-                
-#                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-#                 end_msg = f"[{timestamp}] COMPLETED & MERGED: {group} - {senario}"
-#                 print(end_msg)
-                
-#                 # Append completion status to log
-#                 with open(log_file_path, "a") as log:
-#                     log.write(end_msg + "\n\n")
-            
-#             # Final sync for current cycle before moving to the next
-#             barrier()
-#     except Exception as e:
-#         if myid == 0:
-#             print(f"\nCRITICAL ERROR in {group}_{senario}")
-#         # Re-raise error to let Slurm catch the non-zero exit code if desired
-#         raise e
-
-#     finally:
-#         # Guaranteed cleanup for sbatch termination
-#         if myid == 0:
-#             print("\n" + "="*60)
-#             print("ALL CYCLES COMPLETE - TERMINATING JOB")
-#             print("="*60)
-        
-#         barrier()   # Ensure all ranks reach this point
-#         finalize()  # Cleanly close MPI communication
-#         sys.exit(0) # Signal success to Slurm    
-
-
-
-
-
-
-
-
-
-        # # --- START OF 2-CYCLE LOOP ---
-        # for senario in senaio_list:
-        #     if myid == 0:
-        #         print(f"\n" + "="*60)
-        #         print(f"STARTING {group} - {senario}")
-        #         print("="*60)
-
-        #     TMS_OUTPUT_FOLDER =group_path + '/' + senario + '/tms_files'
-        #     case_path = group_path + '/' + senario
-
-        #     # Unique output name for each cycle
-        #     sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
-
-        #     # Instantiate and Run Simulation
-        #     sim = HurricaneSimulation(
-        #         myid, numprocs, topography_file, mesh_file, finer_zone_path,
-        #         sww_input, sww_continue, base_resolution, finer_zone_resolution,
-        #         TMS_OUTPUT_FOLDER, radius, gauges
-        #     )
-            
-        #     sim.setup_domain()
-        #     sim.setup_inlets()
-        #     sim.evolve()
-            
-        #     # Synchronize after evolution
-        #     barrier()
-
-        #     # Master process merges results
-        #     if myid == 0:
-        #         print(f"Master: Merging partial files for resolution {group}_{senario}...")
-        #         merge_sww_files_parallel_parts(
-        #             directory=case_path,
-        #             output_name=f'Hurricane_{group}_{senario}_merged' + '.sww',
-        #             delete_originals=True,
-        #             verbose=True
-        #         )
-            
-        #     # Final sync for current cycle before moving to the next
-        #     barrier()
 
