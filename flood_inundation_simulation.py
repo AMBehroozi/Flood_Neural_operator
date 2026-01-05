@@ -30,7 +30,7 @@ def timeout_handler(signum, frame):
 
 class HurricaneSimulation:
     def __init__(self, myid, numprocs, topography_file, mesh_file, finer_zone_path, 
-                 sww_input, sww_continue, base_resolution, finer_zone_resolution, 
+                 sww_input, sww_continue, case_path, base_resolution, finer_zone_resolution, 
                  tms_dir, radius, gauges):
         self.myid = myid
         self.numprocs = numprocs
@@ -39,6 +39,7 @@ class HurricaneSimulation:
         self.finer_zone_path = finer_zone_path
         self.sww_input = sww_input
         self.sww_continue = sww_continue
+        self.case_path = case_path
         self.base_resolution = base_resolution
         self.finer_zone_resolution = finer_zone_resolution
         self.tms_dir = tms_dir
@@ -76,18 +77,19 @@ class HurricaneSimulation:
 
         finer_zone = anuga.read_polygon(self.finer_zone_path)
         interior_regions = [[finer_zone, self.finer_zone_resolution]]
-
+        
+        unique_mesh_filename = os.path.join(self.case_path, f"mesh_{group}_{senario}.msh")
         self.domain = anuga.create_domain_from_regions(
             bounding_polygon=bounding_polygon,
             boundary_tags={'west': [0], 'north': [1], 'east': [2], 'south': [3]},
             maximum_triangle_area=self.base_resolution,
             interior_regions=interior_regions,
-            mesh_filename=self.mesh_file,
+            mesh_filename=unique_mesh_filename,
             use_cache=False,
             verbose=False
         )
         self.domain.set_name(self.sww_continue)
-
+        self.domain.set_datadir(case_path)
         # Spatial interpolation of states to new mesh
         print("Master: Performing spatial interpolation...")
         old_coords = states['vertices']
@@ -219,12 +221,23 @@ if __name__ == "__main__":
         {"id": "Bc8_11236643", "x": 231177.77, "y": 3904981.34},
     ]
 
-    group = 'group_024'  # group_XXX
-    group_path = 'scenario_groups/' + group
+    # group = 'group_000'  # group_XXX
+
+    # --- COMMAND LINE INPUT FOR GROUP ---
+    # sys.argv[0] is the script name, sys.argv[1] is the first argument
+    if len(sys.argv) > 1:
+        group = sys.argv[1]
+    else:
+        # # Default fallback if no argument is provided
+        # group = 'group_023'
+        if myid == 0:
+            print(f"Warning: No group provided. Using default: {group}")
+
+    group_path = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/' + group
     senaio_list = get_subfolders(group_path)
 
     # Define the log file path in the root directory
-    log_file_path = f"simulation_progress_{group}.log"
+    log_file_path = f"logs/simulation_progress_{group}.log"
     
     # Track failed scenarios
     failed_scenarios = []
@@ -232,7 +245,22 @@ if __name__ == "__main__":
 
     # --- START OF SCENARIO LOOP ---
     for senario in senaio_list:
-        # Flag to track if this rank encountered an error (0=success, 1=error)
+        # 1. CHECK IF ALREADY PROCESSED/MERGED
+        case_path = os.path.join(group_path, senario)
+        merged_filename = f'Hurricane_{group}_{senario}_merged.sww'
+        merged_file_path = os.path.join(case_path, merged_filename)
+
+        if os.path.exists(merged_file_path):
+            if myid == 0:
+                print(f"Skipping {senario}: Merged file already exists.")
+                # Write to log file immediately
+                with open(log_file_path, "a") as log:
+                    log.write(f"Skipping {senario}: Merged file already exists.\n")
+
+            continue
+        
+        
+        # Flag to track if this rank encountered an error (0=success, 1=error) domain.set_datadir
         error_occurred = 0
         
         try:
@@ -240,8 +268,8 @@ if __name__ == "__main__":
             case_path = os.path.join(group_path, senario)
 
             # Unique output name for each cycle
-            sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
-
+            # sww_continue = os.path.join(case_path, f'Hurricane_{group}_{senario}')
+            sww_continue = f'Hurricane_{group}_{senario}'
             if myid == 0:
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 start_msg = f"[{timestamp}] STARTING: {group} - {senario}\n"
@@ -254,7 +282,7 @@ if __name__ == "__main__":
             # Instantiate and Run Simulation
             sim = HurricaneSimulation(
                 myid, numprocs, topography_file, mesh_file, finer_zone_path,
-                sww_input, sww_continue, base_resolution, finer_zone_resolution,
+                sww_input, sww_continue, case_path, base_resolution, finer_zone_resolution,
                 TMS_OUTPUT_FOLDER, radius, gauges
             )
             
