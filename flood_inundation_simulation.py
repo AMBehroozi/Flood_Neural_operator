@@ -18,7 +18,6 @@ import os
 
 
 
-
 class TimeoutException(Exception):
     """Raised when a scenario times out"""
     pass
@@ -203,8 +202,8 @@ if __name__ == "__main__":
     data_dir = '/storage/group/cxs1024/default/mehdi/Hurricane_MatthewData/DEM10/'
     topography_file = os.path.join(data_dir, 'DM10GLDN2.asc')
     mesh_file = 'mesh/hurricane_domain_final_backup.msh'
-    finer_zone_path = 'finer_zone2.csv'
-    sww_input = "Hurricane_steady_state_phase_2.sww"
+    finer_zone_path = 'data/finer_zone2.csv'
+    sww_input = "data/Hurricane_steady_state_phase_2.sww"
 
     base_resolution = 70000.0
     finer_zone_resolution = 7000
@@ -229,11 +228,11 @@ if __name__ == "__main__":
         group = sys.argv[1]
     else:
         # # Default fallback if no argument is provided
-        # group = 'group_023'
+        group = 'group_004'
         if myid == 0:
             print(f"Warning: No group provided. Using default: {group}")
 
-    group_path = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/' + group
+    group_path = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/scenario_groups_1/' + group
     senaio_list = get_subfolders(group_path)
 
     # Define the log file path in the root directory
@@ -288,7 +287,7 @@ if __name__ == "__main__":
             
             sim.setup_domain()
             sim.setup_inlets()
-            sim.evolve(log_file_path=log_file_path)
+            sim.evolve(log_file_path=log_file_path, yieldstep_factor=0.125)
             
         except Exception as e:
             # Mark that this rank had an error
