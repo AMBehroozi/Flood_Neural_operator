@@ -259,17 +259,17 @@ class FNO3d(nn.Module):
         self.encoder_num_layers = encoder_num_layers
         self.width = width
         self.padding = 6 # pad the domain if input is non-periodic
-        self.encoder = UNetEncoder3d(channels=self.width, 
-                                            num_layers=self.encoder_num_layers, 
-                                            target_mx=self.encoder_kernel_size_x, 
-                                            target_my=self.encoder_kernel_size_y)
+        # self.encoder = UNetEncoder3d(channels=self.width, 
+        #                                     num_layers=self.encoder_num_layers, 
+        #                                     target_mx=self.encoder_kernel_size_x, 
+        #                                     target_my=self.encoder_kernel_size_y)
 
-        # Initialize here instead of None
-        self.decoder = DeepDynamicUNetDecoder3d(
-                                            channels=self.width,           # Your width
-                                            num_layers=4,          # 4 upsampling stages (20→40→80→160→313)
-                                            num_residual_blocks=1  # 2 residual blocks per stage
-)
+        # # Initialize here instead of None
+        # self.decoder = DeepDynamicUNetDecoder3d(
+        #                                     channels=self.width,           # Your width
+        #                                     num_layers=4,          # 4 upsampling stages (20→40→80→160→313)
+        #                                     num_residual_blocks=1  # 2 residual blocks per stage
+# )
         self.fc0 = nn.Linear(self.T_in + 5, self.width)
         # input channel is 12: the solution of the first 10 timesteps + 3 locations (u(1, x, y), ..., u(10, x, y),  x, y, t)
 
@@ -329,7 +329,7 @@ class FNO3d(nn.Module):
         x = self.fc1(x)
         x = F.gelu(x)
         x = self.fc2(x).squeeze(-1)
-        return x
+        return x[..., 1:]
 
 
     def get_grid(self, shape, device):
