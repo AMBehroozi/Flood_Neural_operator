@@ -99,7 +99,7 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
             batch_forcing = batch_data[0]
             batch_u0      = batch_data[1][..., :T_in]
             batch_u_out   = batch_data[1][..., T_in:]
-            batch_u_out = coarsen_spatial_tensor(batch_u_out, N=magnification_factor)
+            batch_u_out = coarsen_spatial_tensor(batch_u_out, N=magnification_factor, mode='bilinear')
             bs = batch_u0.shape[0]
             total_samples += bs
 
@@ -151,7 +151,7 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
                 batch_forcing = batch_data[0]
                 batch_u0      = batch_data[1][..., :T_in]
                 batch_u_out   = batch_data[1][..., T_in:]
-                batch_u_out = coarsen_spatial_tensor(batch_u_out, N=magnification_factor)
+                batch_u_out = coarsen_spatial_tensor(batch_u_out, N=magnification_factor, mode='bilinear')
                 bs = batch_u0.shape[0]
                 total_val_samples += bs
 
