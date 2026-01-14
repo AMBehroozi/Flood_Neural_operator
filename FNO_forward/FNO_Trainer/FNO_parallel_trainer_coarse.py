@@ -85,6 +85,7 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
     torch.cuda.empty_cache()
     nx = None
     ny = None
+
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
 
@@ -129,6 +130,10 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
                 loss = data_loss
 
             loss.backward()
+
+            # ─── Added gradient clipping ───
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_fnoloss += data_loss.item() * bs
@@ -139,6 +144,61 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
 
         train_fnolosses.append(epoch_fnoloss)
         train_iglosses.append(epoch_igloss)
+
+    # for ep in outer_loop:
+    #     train_sampler.set_epoch(ep)
+
+    #     # ---------------- Training phase ----------------
+    #     model.train()
+    #     total_fnoloss = 0.0
+    #     total_igloss = 0.0
+    #     total_samples = 0
+
+    #     for batch_data in train_loader:
+    #         batch_data = [item.to(rank) for item in batch_data]
+
+    #         batch_forcing = batch_data[0]
+    #         batch_u0      = batch_data[1][..., :T_in]
+    #         batch_u_out   = batch_data[1][..., T_in:]
+    #         batch_u_out = coarsen_spatial_tensor(batch_u_out, N=magnification_factor, mode='bilinear')
+    #         bs = batch_u0.shape[0]
+    #         total_samples += bs
+
+    #         # topo is constant -> expand (no copy)
+    #         batch_topo = topo.expand(bs, -1, -1)
+
+    #         if nx is None or ny is None:
+    #             nx, ny = batch_forcing.shape[1:3]
+
+    #         optimizer.zero_grad(set_to_none=True)
+
+    #         U_pred = model(batch_forcing, batch_u0, batch_topo)
+    #         data_loss = criterion(U_pred, batch_u_out)
+    #         if enable_ig_loss:
+    #             # NOTE: you must define/provide these variables if you truly enable IG:
+    #             # batch_parameter, batch_u_in, du_dp__low_rank_true
+    #             U_mat_pred, V_mat_pred = compute_low_rank_jacobian_1(
+    #                 model, U_pred, batch_parameter, batch_u_in, rank=5, epsilon=1e-1, seed=None
+    #             )
+    #             ig_loss = compute_low_rank_jacobian_loss(
+    #                 du_dp__low_rank_true, U_mat_pred, V_mat_pred, method='action'
+    #             )
+    #             loss = awl(data_loss, ig_loss)
+    #         else:
+    #             ig_loss = data_loss.new_tensor(0.0)
+    #             loss = data_loss
+
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         total_fnoloss += data_loss.item() * bs
+    #         total_igloss  += ig_loss.item() * bs
+
+    #     epoch_fnoloss = total_fnoloss / total_samples
+    #     epoch_igloss  = total_igloss  / total_samples
+
+    #     train_fnolosses.append(epoch_fnoloss)
+    #     train_iglosses.append(epoch_igloss)
 
         # ---------------- Evaluation phase ----------------
         model.eval()
@@ -277,8 +337,8 @@ def main(
     # but keeping your current pattern for now.
     model_fn = FNO3d(
         T_in=T_in, T_out=T_out,
-        modes_x=8, modes_y=8, modes_t=8,
-        width=20,
+        modes_x=mode1, modes_y=mode2, modes_t=mode3,
+        width=width_FNO,
         encoder_kernel_size_x=82,
         encoder_kernel_size_y=41,
         encoder_num_layers=4
@@ -352,7 +412,7 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    num_samples_x_y = 'test_coarse'  # Number of random samples along x, y axes for Jacobian calculations
+    num_samples_x_y = 'test_coarse3'  # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
     batch_size = 2
@@ -380,9 +440,9 @@ if __name__ == "__main__":
     unet_depth = 4
 
     # FNO inputs
-    mode_x = 8
-    mode_y = 8
-    mode_t = 8
+    mode_x = 6
+    mode_y = 6
+    mode_t = 6
     width_FNO = 20
 
     # WNO inputs
