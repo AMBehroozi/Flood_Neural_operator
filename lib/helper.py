@@ -6,7 +6,35 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler
+import torch.nn.functional as F
 
+def coarsen_spatial_tensor(tensor, N):
+    """
+    Coarsens a tensor of shape [nb, nx, ny, nt] by a factor of N 
+    using spatial averaging. If N=1, returns the original tensor.
+    """
+    # 0. Early exit for no coarsening
+    if N == 1:
+        return tensor
+        
+    # 1. Capture original shapes
+    nb, nx, ny, nt = tensor.shape
+    
+    # 2. Reshape to [nb * nt, 1, nx, ny] 
+    # Move nt into the batch dimension for 2D pooling
+    x = tensor.permute(0, 3, 1, 2).reshape(nb * nt, 1, nx, ny)
+    
+    # 3. Apply Average Pooling
+    # kernel_size and stride are both N
+    x_coarse = F.avg_pool2d(x, kernel_size=N, stride=N)
+    
+    # 4. Get new spatial dimensions
+    _, _, nx_new, ny_new = x_coarse.shape
+    
+    # 5. Reshape and Permute back to [nb, nx_new, ny_new, nt]
+    result = x_coarse.view(nb, nt, nx_new, ny_new).permute(0, 2, 3, 1)
+    
+    return result
 
 class LargeHydrologyDataset(Dataset):
     def __init__(self, file_a, file_u, m_map=True):
