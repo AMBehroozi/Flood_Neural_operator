@@ -27,6 +27,7 @@ from models.fno3d_encoder import FNO3d
 from lib.helper import LargeHydrologyDataset
 from lib.ddp_helpers import setup, cleanup
 from lib.helper import coarsen_spatial_tensor
+from lib.util import run_nvidia_smi, MHPI
 # If you enable IG later, you will need these:
 # from lib.low_rank_jacobian import compute_low_rank_jacobian_1, compute_low_rank_jacobian_loss
 
