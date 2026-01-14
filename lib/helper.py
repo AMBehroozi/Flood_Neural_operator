@@ -9,10 +9,11 @@ from torch.utils.data.distributed import DistributedSampler
 
 
 class LargeHydrologyDataset(Dataset):
-    def __init__(self, file_a, file_u):
+    def __init__(self, file_a, file_u, m_map=True):
         # mmap=True keeps data on disk; only indices are loaded initially
-        self.a = torch.load(file_a, mmap=True, map_location='cpu')
-        self.u = torch.load(file_u, mmap=True, map_location='cpu')
+        self.m_map = m_map
+        self.a = torch.load(file_a, mmap=self.m_map, map_location='cpu')
+        self.u = torch.load(file_u, mmap=self.m_map, map_location='cpu')
 
     def __len__(self):
         return self.a.shape[0]
