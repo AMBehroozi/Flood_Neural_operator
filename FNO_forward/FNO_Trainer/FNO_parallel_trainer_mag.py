@@ -98,29 +98,23 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     mx = int(nx/magnification_factor)
     my = int(ny/magnification_factor)
     
-    index_provider = PaddedIndexProvider(mx=mx, my=my, N=5, batch_size=8)
+    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
 
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
         
-        model.train()   # Model 1
-        magnifier.train()  # Magnifier
+        model.train()      # Model 1
+        magnifier.train()  # Model 2
         
         total_fnoloss = 0.0
         total_igloss  = 0.0
-        total_magloss = 0.0  # Loss for Magnifier
+        total_magloss = 0.0
         total_samples = 0
-
-        # Get fresh randomized spatial sweep for this rank/epoch
-        # epoch_indices: [Total_Windows, 2] (Starts in Padded Coordinate System)
-        epoch_indices = index_provider.get_epoch_indices()
 
         for batch_data in train_loader:
             batch_data = [item.to(rank) for item in batch_data]
-
-            # batch_forcing: [bs, nx, ny, nt]
-            # batch_u0:      [bs, nx, ny, T_in]
-            # batch_u_out_hr:[bs, nx, ny, T_out] (Original High-Res Ground Truth)
+            
+            # [nb, nx, ny, nt]
             batch_forcing  = batch_data[0]
             batch_u0       = batch_data[1][..., :T_in]
             batch_u_out_hr = batch_data[1][..., T_in:] 
@@ -129,22 +123,20 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
             total_samples += bs
             batch_topo = topo.expand(bs, -1, -1) # [bs, nx, ny]
 
-            # 1. ─── GLOBAL COARSE PASS (MODEL 1) ───
+            # ---------------------------------------------------------
+            # 1. GLOBAL COARSE PASS (MODEL 1)
+            # ---------------------------------------------------------
             optimizer.zero_grad(set_to_none=True)
             
-            # U_pred: [bs, mx, my, T_out]
+            # Forward pass: [bs, mx, my, T_out]
             U_pred = model(batch_forcing, batch_u0, batch_topo)
             
-            # Ground Truth Coarsening for Model 1 Loss
-            # batch_u_out_lr: [bs, mx, my, T_out]
+            # Coarsen Ground Truth for Loss
             batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
-            
             data_loss = criterion(U_pred, batch_u_out_lr)
             
-            # ... (IG Loss logic for Model 1 remains the same) ...
             if enable_ig_loss:
-                U_mat_pred, V_mat_pred = compute_low_rank_jacobian_1(model, U_pred, ...)
-                ig_loss = compute_low_rank_jacobian_loss(...)
+                # ... IG logic stays here ...
                 loss1 = awl(data_loss, ig_loss)
             else:
                 ig_loss = data_loss.new_tensor(0.0)
@@ -152,109 +144,181 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
 
             loss1.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            optimizer.step() # Update Model 1 weights
 
-            # 2. ─── PATCH REFINEMENT PASS (MODEL 2) ───
-            # We use a 'detach' on U_pred to train Model 2 independently if desired, 
-            # or keep gradients flowing for end-to-end. Here we use detach for stability.
-            
-            # PRE-PADDING: Pad global tensors to satisfy PaddedIndexProvider ranges
-            # u_pad: [bs, mx + 2N, my + 2N, T_out]
+            # ---------------------------------------------------------
+            # 2. PATCH REFINEMENT PASS (MAGNIFIER)
+            # ---------------------------------------------------------
+            # Use .detach() to ensure Model 1 gradients don't accumulate in the spatial loop
             u_pad = F.pad(U_pred.detach().permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
-            # topo_pad: [bs, nx + 2Pf, ny + 2Pf]
             topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
-            # target_pad: [bs, nx + 2Pf, ny + 2Pf, T_out]
             target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
 
-            # Spatial Mini-batching: Process nb_i windows at a time
-            for spatial_batch in index_provider.get_batches():
-                # spatial_batch: [nb_i, 2]
-                
-                # optimizer2.zero_grad(set_to_none=True)
-                
-                batch_patches_in = []
-                batch_patches_trgt = []
+            if Gradient_Accumulation:
+                accumulation_steps = 10 
+                optimizer.zero_grad(set_to_none=True) 
 
-                for (i_s, j_s) in spatial_batch:
-                    # prepare_patch_input returns [bs, 2, Pf, Pf, T_out]
-                    p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
+                # spatial_batch is a subset based on index_provider.subset_fraction
+                for i, spatial_batch in enumerate(index_provider.get_batches()):
+                    batch_patches_in = []
+                    batch_patches_trgt = []
+
+                    for (i_s, j_s) in spatial_batch:
+                        # [bs, 2, Pf, Pf, T_out]
+                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
+                        # [bs, 1, Pf, Pf, T_out]
+                        p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)              
+                        
+                        batch_patches_in.append(p_in)
+                        batch_patches_trgt.append(p_target)
+
+                    # [bs * nb_i, 2, Pf, Pf, T_out]
+                    big_in = torch.cat(batch_patches_in, dim=0)
+                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
+
+                    big_out = magnifier(big_in)
                     
-                    # Slicing target from padded high-res ground truth
-                    # p_target: [bs, 1, Pf, Pf, T_out]
-                    # Change this:
-                    p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)              
-                    batch_patches_in.append(p_in)
-                    batch_patches_trgt.append(p_target)
+                    # Mean loss over virtual batch
+                    mag_loss_batch = criterion(big_out, big_trgt) / accumulation_steps
+                    mag_loss_batch.backward()
+                    
+                    if (i + 1) % accumulation_steps == 0:
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    
+                    total_magloss += (mag_loss_batch.item() * accumulation_steps) * (bs * len(spatial_batch))
 
-                # Flattening: Combine bs and nb_i into one large batch dimension
-                # big_in: [bs * nb_i, 2, Pf, Pf, T_out]
-                big_in = torch.cat(batch_patches_in, dim=0)
-                # big_trgt: [bs * nb_i, 1, Pf, Pf, T_out]
-                big_trgt = torch.cat(batch_patches_trgt, dim=0)
+                # Final step for leftovers
+                if (i + 1) % accumulation_steps != 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
-                # Model 2 Forward
-                # big_out: [bs * nb_i, 1, Pf, Pf, T_out]
-                big_out = magnifier(big_in)
-                
-                mag_loss = criterion(big_out, big_trgt)
-                mag_loss.backward()
-                optimizer.step()
-                
-                total_magloss += mag_loss.item() * (bs * len(spatial_batch))
+            else:
+                # Standard Step-by-Step Refinement
+                for spatial_batch in index_provider.get_batches():
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    batch_patches_in = []
+                    batch_patches_trgt = []
 
-            # Accumulate stats
+                    for (i_s, j_s) in spatial_batch:
+                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
+                        p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)              
+                        batch_patches_in.append(p_in)
+                        batch_patches_trgt.append(p_target)
+
+                    big_in = torch.cat(batch_patches_in, dim=0)
+                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
+
+                    big_out = magnifier(big_in)
+                    mag_loss = criterion(big_out, big_trgt)
+                    mag_loss.backward()
+                    optimizer.step()
+                    
+                    total_magloss += mag_loss.item() * (bs * len(spatial_batch))
+
+            # Accumulate metrics
             total_fnoloss += data_loss.item() * bs
             total_igloss  += ig_loss.item() * bs
 
-        # Epoch Metrics
+        # Final Epoch Statistics
+        # Note: Use num_subset because that is how many windows we actually processed
         epoch_fnoloss = total_fnoloss / total_samples
-        epoch_igloss  = total_igloss  / total_samples
-        epoch_magloss = total_magloss / (total_samples * index_provider.num_total_windows)
-
-        train_fnolosses.append(epoch_fnoloss)
-        train_maglosses.append(epoch_magloss) 
-        # Track magnifier progress
-
+        epoch_magloss = total_magloss / (total_samples * index_provider.num_subset)
+        
         # ---------------- Evaluation phase ----------------
         model.eval()
+        magnifier.eval()
+        
         total_valloss = 0.0
+        total_val_magloss = 0.0
         total_val_samples = 0
+
+        # We use a non-randomized, full systematic sweep for validation 
+        # to get a stable, reproducible score (subset_fraction=1.0)
+        val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=1.0)
 
         with torch.no_grad():
             for batch_data in eval_loader:
                 batch_data = [item.to(rank) for item in batch_data]
 
-                batch_forcing = batch_data[0]
-                batch_u0      = batch_data[1][..., :T_in]
-                batch_u_out   = batch_data[1][..., T_in:]
+                # batch_forcing: [bs, nx, ny, nt]
+                # batch_u_out_hr: [bs, nx, ny, T_out]
+                batch_forcing  = batch_data[0]
+                batch_u0       = batch_data[1][..., :T_in]
+                batch_u_out_hr = batch_data[1][..., T_in:]
 
                 bs = batch_u0.shape[0]
                 total_val_samples += bs
-
                 batch_topo = topo.expand(bs, -1, -1)
 
+                # 1. ─── Model 1 Validation (Global Coarse) ───
+                # U_pred: [bs, mx, my, T_out]
                 U_pred = model(batch_forcing, batch_u0, batch_topo)
-                val_loss = criterion(U_pred, batch_u_out)
-
+                
+                # Coarsen ground truth to match global model resolution
+                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
+                val_loss = criterion(U_pred, batch_u_out_lr)
                 total_valloss += val_loss.item() * bs
 
+                # 2. ─── Magnifier Validation (Local Refinement) ───
+                # Prepare padded tensors for full-domain sweep
+                u_pad = F.pad(U_pred.permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
+                topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
+                target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
+
+                # Loop through ALL windows in the domain for a complete high-res assessment
+                for spatial_batch in val_index_provider.get_batches():
+                    batch_patches_in = []
+                    batch_patches_trgt = []
+
+                    for (i_s, j_s) in spatial_batch:
+                        # Extract and prepare input: [bs, 2, Pf, Pf, T_out]
+                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
+                        # Extract target patch: [bs, 1, Pf, Pf, T_out]
+                        p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
+                        
+                        batch_patches_in.append(p_in)
+                        batch_patches_trgt.append(p_target)
+
+                    # Flatten batch: [bs * batch_size, ...]
+                    big_in = torch.cat(batch_patches_in, dim=0)
+                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
+
+                    # Magnifier prediction
+                    big_out = magnifier(big_in)
+                    mag_val_loss = criterion(big_out, big_trgt)
+                    
+                    # Accumulate loss based on number of patches in this spatial batch
+                    total_val_magloss += mag_val_loss.item() * (bs * len(spatial_batch))
+
+        # 3. ─── Metrics Normalization ───
         epoch_valloss = total_valloss / total_val_samples
+        
+        # total_val_magloss is divided by (total_samples * total_spatial_windows)
+        epoch_val_magloss = total_val_magloss / (total_val_samples * val_index_provider.num_total_windows)
+        
         val_losses.append(epoch_valloss)
+        val_maglosses.append(epoch_val_magloss)
 
         # ---------------- Logging / saving ----------------
         losses_dict = {
-            'Training FNO Loss': train_fnolosses,
-            'Validation Loss': val_losses
+            'Train FNO Loss': train_fnolosses,
+            'Train Mag Loss': train_maglosses,
+            'Val FNO Loss': val_losses,
+            'Val Mag Loss': val_maglosses
         }
         if enable_ig_loss:
             losses_dict['Train IG loss'] = train_iglosses
 
+        # Convert to DataFrame for persistence
         df = pd.DataFrame(losses_dict)
 
-        save_results = False
+        # Ensure we only save on the primary rank in DDP
         if save_results and (ep % 5 == 0) and (rank == 0):
             torch.save({
                 'config': {
+                    # --- Original Model 1 Config ---
                     'operator_type': operator_type,
                     'enable_ig_loss': enable_ig_loss,
                     'Nx': nx,
@@ -276,30 +340,129 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                     'width_WNO': width_WNO,
                     'branch_layers': branch_layers,
                     'trunk_layers': trunk_layers,
+                    
+                    # --- New Magnifier / Refinement Config ---
+                    'mx_coarse': mx,
+                    'my_coarse': my,
+                    'N_window': N,           # Coarse window size (e.g., 5)
+                    'f_upscale': f,          # Magnification factor (e.g., 10)
+                    'Pf_fine': N * f,        # Resulting fine patch size
+                    'subset_fraction': 0.2,  # Plan 1: Stochastic subsampling %
+                    'accumulation_steps': 10 if Gradient_Accumulation else 1 # Plan 2
                 },
                 'epoch': ep,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss_df': df,          # clearer name
+                'model_state_dict': model.state_dict(),          # Global Model
+                'magnifier_state_dict': magnifier.state_dict(),  # Magnifier Model
+                'optimizer_state_dict': optimizer.state_dict(),  # Shared Optimizer
+                'loss_df': df,                                   # Full loss history
             }, PATH_saved_models + f'/saved_model_{Mode}.pth')
+            
+            print(f"--- Checkpoint saved at Epoch {ep+1} ---")
 
-        if plot_live_loss and (ep % 1 == 0):
+
+        # Live Plotting
+        if plot_live_loss and (rank == 0):
             loss_live_plot(losses_dict)
 
         scheduler.step()
 
-        outer_loop.set_description(f"Progress (Epoch {ep + 1}/{epochs}) Mode: {Mode}")
-        if enable_ig_loss:
-            outer_loop.set_postfix(
-                train_loss=f'{epoch_fnoloss:.2e}',
-                ig_loss=f'{epoch_igloss:.2e}',
-                val_loss=f'{epoch_valloss:.2e}'
-            )
-        else:
-            outer_loop.set_postfix(
-                train_loss=f'{epoch_fnoloss:.2e}',
-                val_loss=f'{epoch_valloss:.2e}'
-            )
+        # Update Progress Bar with current results
+        outer_loop.set_description(f"Epoch {ep + 1}/{epochs}")
+        outer_loop.set_postfix(
+            fno_v=f'{epoch_valloss:.2e}',
+            mag_v=f'{epoch_val_magloss:.2e}',
+            mag_t=f'{epoch_magloss:.2e}' # From training phase
+        )
+
+
+
+
+
+        # # ---------------- Evaluation phase ----------------
+        # model.eval()
+        # total_valloss = 0.0
+        # total_val_samples = 0
+
+        # with torch.no_grad():
+        #     for batch_data in eval_loader:
+        #         batch_data = [item.to(rank) for item in batch_data]
+
+        #         batch_forcing = batch_data[0]
+        #         batch_u0      = batch_data[1][..., :T_in]
+        #         batch_u_out   = batch_data[1][..., T_in:]
+
+        #         bs = batch_u0.shape[0]
+        #         total_val_samples += bs
+
+        #         batch_topo = topo.expand(bs, -1, -1)
+
+        #         U_pred = model(batch_forcing, batch_u0, batch_topo)
+        #         val_loss = criterion(U_pred, batch_u_out)
+
+        #         total_valloss += val_loss.item() * bs
+
+        # epoch_valloss = total_valloss / total_val_samples
+        # val_losses.append(epoch_valloss)
+
+        # # ---------------- Logging / saving ----------------
+        # losses_dict = {
+        #     'Training FNO Loss': train_fnolosses,
+        #     'Validation Loss': val_losses
+        # }
+        # if enable_ig_loss:
+        #     losses_dict['Train IG loss'] = train_iglosses
+
+        # df = pd.DataFrame(losses_dict)
+
+        # save_results = False
+        # if save_results and (ep % 5 == 0) and (rank == 0):
+        #     torch.save({
+        #         'config': {
+        #             'operator_type': operator_type,
+        #             'enable_ig_loss': enable_ig_loss,
+        #             'Nx': nx,
+        #             'Ny': ny,
+        #             'T_in': T_in,
+        #             'T_out': T_out,
+        #             'width_CNO': width_CNO,
+        #             'depth_CNO': depth_CNO,
+        #             'kernel_size': kernel_size,
+        #             'unet_depth': unet_depth,
+        #             'mode1': mode1,
+        #             'mode2': mode2,
+        #             'mode3': mode3,
+        #             'width_FNO': width_FNO,
+        #             'wavelet': wavelet,
+        #             'level': level,
+        #             'layers': layers,
+        #             'grid_range': grid_range,
+        #             'width_WNO': width_WNO,
+        #             'branch_layers': branch_layers,
+        #             'trunk_layers': trunk_layers,
+        #         },
+        #         'epoch': ep,
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         'loss_df': df,          # clearer name
+        #     }, PATH_saved_models + f'/saved_model_{Mode}.pth')
+
+        # if plot_live_loss and (ep % 1 == 0):
+        #     loss_live_plot(losses_dict)
+
+        # scheduler.step()
+
+        # outer_loop.set_description(f"Progress (Epoch {ep + 1}/{epochs}) Mode: {Mode}")
+        # if enable_ig_loss:
+        #     outer_loop.set_postfix(
+        #         train_loss=f'{epoch_fnoloss:.2e}',
+        #         ig_loss=f'{epoch_igloss:.2e}',
+        #         val_loss=f'{epoch_valloss:.2e}'
+        #     )
+        # else:
+        #     outer_loop.set_postfix(
+        #         train_loss=f'{epoch_fnoloss:.2e}',
+        #         val_loss=f'{epoch_valloss:.2e}'
+        #     )
 
     cleanup()
 
