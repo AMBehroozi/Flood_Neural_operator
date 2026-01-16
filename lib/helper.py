@@ -8,22 +8,20 @@ from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
 
+
 class PaddedIndexProvider:
-    def __init__(self, mx, my, N, batch_size=32):
-        # We increase the 'effective' domain so windows can overlap the real edges
+    def __init__(self, mx, my, N, batch_size=32, subset_fraction=1.0):
         self.padding = N
         self.effective_mx = mx + 2 * self.padding
         self.effective_my = my + 2 * self.padding
         self.N = N
         self.batch_size = batch_size
+        self.subset_fraction = subset_fraction # P% e.g. 0.2
         
-        # Valid starts in the padded coordinate system
         self.max_x = self.effective_mx - N
         self.max_y = self.effective_my - N
+        self.stride = max(1, N)
         
-        self.stride = max(1, N // 2)
-        
-        # Grid covers the entire padded area
         self.x_bases = np.arange(0, self.max_x + 1, self.stride)
         self.y_bases = np.arange(0, self.max_y + 1, self.stride)
         
@@ -33,7 +31,9 @@ class PaddedIndexProvider:
             torch.from_numpy(yv.flatten()).float()
         ], dim=1)
         
+        # Calculate how many windows to pick per epoch
         self.num_total_windows = len(self.base_coords)
+        self.num_subset = max(1, int(self.num_total_windows * self.subset_fraction))
 
     def get_epoch_indices(self):
         shift_x = torch.randint(0, self.stride, (1,)).item()
@@ -43,22 +43,20 @@ class PaddedIndexProvider:
         coords[:, 0] += shift_x
         coords[:, 1] += shift_y
         
-        # Local jitter
         jitter = torch.randint(-1, 2, coords.shape).float()
         coords += jitter
         
-        # Hard clamp to ensure indices are ALWAYS positive and safe for slicing
         coords[:, 0] = torch.clamp(coords[:, 0], 0, self.max_x)
         coords[:, 1] = torch.clamp(coords[:, 1], 0, self.max_y)
         
-        return coords[torch.randperm(self.num_total_windows)].long()
-
+        # Shuffle and take only the P% subset
+        shuffled = coords[torch.randperm(self.num_total_windows)]
+        return shuffled[:self.num_subset].long()
 
     def get_batches(self):
         indices = self.get_epoch_indices()
-        for i in range(0, self.num_total_windows, self.batch_size):
+        for i in range(0, len(indices), self.batch_size):
             yield indices[i : i + self.batch_size]
-
 
 def prepare_patch_input(
     coarse_u,          # Input: Coarse u from global model [nb, mx, my, nt]
