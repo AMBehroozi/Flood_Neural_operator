@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, Subset
@@ -24,35 +25,15 @@ from lib.utilities3 import ensure_directory
 from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 
 from models.fno3d_encoder import FNO3d
+from models.magnifier import MagnifierModel as magnifier
+
 from lib.helper import LargeHydrologyDataset
 from lib.ddp_helpers import setup, cleanup
 from lib.helper import coarsen_spatial_tensor
-import torch.nn.functional as F
-
-# If you enable IG later, you will need these:
-# from lib.low_rank_jacobian import compute_low_rank_jacobian_1, compute_low_rank_jacobian_loss
+from lib.helper import PaddedIndexProvider, prepare_patch_input
 
 
-#
-
-def DummyMagnifier(patch_input):
-    """
-    Input:
-        patch_input: [nb_total, 2, P_fine, P_fine, nt]
-    Output:
-        refined_u:   [nb_total, 1, P_fine, P_fine, nt]
-    """
-    conv = nn.Conv3d(in_channels=2, out_channels=1, kernel_size=3, padding=1)
-    # Apply a dummy operation to mimic refinement
-    # We use Conv3d to maintain the temporal and spatial relationships
-    refined_u = conv(patch_input)
-    return refined_u
-
-
-#
-
-
-def train_model(rank, world_size, model_fn, awl_fn, learning_rate, 
+def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate, 
                 operator_type, T_in, T_out,
                 magnification_factor,
                 width_CNO, depth_CNO, kernel_size, unet_depth,  # CNO inputs
@@ -68,19 +49,26 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
 
     # ---- Model + DDP ----
     model = model_fn.to(rank)  # ideally model_fn is a fresh instance per rank
+    magnifier = magnifier_fn.to(rank)
+   
     model = DDP(model, device_ids=[rank])
-
+    magnifier = DDP(magnifier, device_ids=[rank])
+ 
     # ---- Optimizer (AWL only if IG enabled) ----
     if enable_ig_loss:
         awl = awl_fn.to(rank)
         awl = DDP(awl, device_ids=[rank])
         optimizer = optim.Adam(
             [{'params': model.parameters(), 'lr': learning_rate},
+             {'params': magnifier.parameters(), 'lr': learning_rate},
              {'params': awl.parameters(),   'lr': learning_rate}]
         )
     else:
         awl = None
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+        optimizer = optim.Adam(
+            [{'params': model.parameters(), 'lr': learning_rate},
+             {'params': magnifier.parameters(), 'lr': learning_rate}]
+        )
 
     scheduler = StepLR(optimizer, step_size=50, gamma=0.85)
 
@@ -110,13 +98,13 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
     N = 5
     f = magnification_factor
 
-    index_provider = PaddedIndexProvider(mx=82, my=41, N=5, batch_size=32)
+    index_provider = PaddedIndexProvider(mx=82, my=41, N=5, batch_size=16)
     # Assuming model2, optimizer2, and index_provider are initialized per rank
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
         
         model.train()   # Model 1
-        # model2.train()  # Magnifier
+        magnifier.train()  # Magnifier
         
         total_fnoloss = 0.0
         total_igloss  = 0.0
@@ -209,11 +197,11 @@ def train_model(rank, world_size, model_fn, awl_fn, learning_rate,
 
                 # Model 2 Forward
                 # big_out: [bs * nb_i, 1, Pf, Pf, T_out]
-                big_out = DummyMagnifier(big_in)
+                big_out = magnifier(big_in)
                 
                 mag_loss = criterion(big_out, big_trgt)
-                # mag_loss.backward()
-                # optimizer2.step()
+                mag_loss.backward()
+                optimizer2.step()
                 
                 total_magloss += mag_loss.item() * (bs * len(spatial_batch))
 
@@ -374,6 +362,21 @@ def main(
         encoder_num_layers=4
     )
 
+    magnifier_fn = magnifier(
+        in_channels=C_in,
+        base_channels=32,
+        num_fno_blocks=4,
+        fno_modes_x=6,
+        fno_modes_y=6,
+        num_refinement_blocks=4,
+        num_residual_per_block=3,
+        channel_multipliers=[1.0, 1.5, 2, 2],  # 48→64→80→96→96
+        dropout=0.1,
+        use_attention=False,
+        use_pyramid_pooling=True,
+        use_gradient_checkpointing=False
+    )
+
     # Only needed if IG is enabled (still safe to create)
     ss = 2 if enable_ig_loss else 1
     awl_fn = AutomaticWeightedLoss(ss)
@@ -382,7 +385,7 @@ def main(
     torch.multiprocessing.spawn(
         train_model,
         args=(
-            world_size, model_fn, awl_fn, learning_rate,
+            world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
             operator_type, T_in, T_out,
             magnification_factor,
             width_CNO, depth_CNO, kernel_size, unet_depth,
