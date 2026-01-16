@@ -31,6 +31,7 @@ from lib.helper import LargeHydrologyDataset
 from lib.ddp_helpers import setup, cleanup
 from lib.helper import coarsen_spatial_tensor
 from lib.helper import PaddedIndexProvider, prepare_patch_input
+from lib.util import run_nvidia_smi, MHPI
 
 
 def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate, 
@@ -42,7 +43,8 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 branch_layers, trunk_layers,                    # DeepONet inputs
 
                 epochs, PATH_saved_models, Mode, num_samples_x_y, 
-                enable_ig_loss, L_x, L_y, criterion, plot_live_loss, 
+                enable_ig_loss, L_x, L_y, criterion, plot_live_loss,
+                save_results, 
                 case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx):
     
     setup(rank, world_size)
@@ -88,7 +90,9 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     eval_loader  = DataLoader(eval_dataset,  batch_size=batch_size, sampler=eval_sampler,  drop_last=False)
 
     # ---- Logs ----
-    train_fnolosses, train_iglosses, val_losses = [], [], []
+    train_fnolosses, train_iglosses, val_losses, val_maglosses  = [], [], [], []
+    train_losses, train_maglosses = [], []
+
     outer_loop = tqdm(range(epochs), desc="Progress", position=0)
     torch.cuda.empty_cache()
     
@@ -98,7 +102,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     mx = int(nx/magnification_factor)
     my = int(ny/magnification_factor)
     
-    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.5)
+    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=16, subset_fraction=0.2)
 
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
@@ -227,6 +231,10 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
         # Note: Use num_subset because that is how many windows we actually processed
         epoch_fnoloss = total_fnoloss / total_samples
         epoch_magloss = total_magloss / (total_samples * index_provider.num_subset)
+
+        train_losses.append(epoch_fnoloss)
+        train_maglosses.append(epoch_magloss)
+
         
         # ---------------- Evaluation phase ----------------
         model.eval()
@@ -238,7 +246,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
 
         # We use a non-randomized, full systematic sweep for validation 
         # to get a stable, reproducible score (subset_fraction=1.0)
-        val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=1.0)
+        val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
 
         with torch.no_grad():
             for batch_data in eval_loader:
@@ -305,7 +313,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
 
         # ---------------- Logging / saving ----------------
         losses_dict_main = {
-            'Train FNO Loss': train_fnolosses,
+            'Train FNO Loss': train_losses,
             'Val FNO Loss': val_losses
         }
         if enable_ig_loss:
@@ -320,7 +328,6 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
         df_main = pd.DataFrame(losses_dict_main)
         df_magnifier = pd.DataFrame(losses_dict_magnifier)
 
-        save_results = False
         # Ensure we only save on the primary rank in DDP
         if save_results and (ep % 5 == 0) and (rank == 0):
             torch.save({
@@ -368,7 +375,6 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
             
             print(f"--- Checkpoint saved at Epoch {ep+1} ---")
 
-
         # Live Plotting
         if plot_live_loss and (rank == 0):
             loss_live_plot(losses_dict)
@@ -384,101 +390,13 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
         )
 
 
-
-
-
-        # # ---------------- Evaluation phase ----------------
-        # model.eval()
-        # total_valloss = 0.0
-        # total_val_samples = 0
-
-        # with torch.no_grad():
-        #     for batch_data in eval_loader:
-        #         batch_data = [item.to(rank) for item in batch_data]
-
-        #         batch_forcing = batch_data[0]
-        #         batch_u0      = batch_data[1][..., :T_in]
-        #         batch_u_out   = batch_data[1][..., T_in:]
-
-        #         bs = batch_u0.shape[0]
-        #         total_val_samples += bs
-
-        #         batch_topo = topo.expand(bs, -1, -1)
-
-        #         U_pred = model(batch_forcing, batch_u0, batch_topo)
-        #         val_loss = criterion(U_pred, batch_u_out)
-
-        #         total_valloss += val_loss.item() * bs
-
-        # epoch_valloss = total_valloss / total_val_samples
-        # val_losses.append(epoch_valloss)
-
-        # # ---------------- Logging / saving ----------------
-        # losses_dict = {
-        #     'Training FNO Loss': train_fnolosses,
-        #     'Validation Loss': val_losses
-        # }
-        # if enable_ig_loss:
-        #     losses_dict['Train IG loss'] = train_iglosses
-
-        # df = pd.DataFrame(losses_dict)
-
-        # save_results = False
-        # if save_results and (ep % 5 == 0) and (rank == 0):
-        #     torch.save({
-        #         'config': {
-        #             'operator_type': operator_type,
-        #             'enable_ig_loss': enable_ig_loss,
-        #             'Nx': nx,
-        #             'Ny': ny,
-        #             'T_in': T_in,
-        #             'T_out': T_out,
-        #             'width_CNO': width_CNO,
-        #             'depth_CNO': depth_CNO,
-        #             'kernel_size': kernel_size,
-        #             'unet_depth': unet_depth,
-        #             'mode1': mode1,
-        #             'mode2': mode2,
-        #             'mode3': mode3,
-        #             'width_FNO': width_FNO,
-        #             'wavelet': wavelet,
-        #             'level': level,
-        #             'layers': layers,
-        #             'grid_range': grid_range,
-        #             'width_WNO': width_WNO,
-        #             'branch_layers': branch_layers,
-        #             'trunk_layers': trunk_layers,
-        #         },
-        #         'epoch': ep,
-        #         'model_state_dict': model.state_dict(),
-        #         'optimizer_state_dict': optimizer.state_dict(),
-        #         'loss_df': df,          # clearer name
-        #     }, PATH_saved_models + f'/saved_model_{Mode}.pth')
-
-        # if plot_live_loss and (ep % 1 == 0):
-        #     loss_live_plot(losses_dict)
-
-        # scheduler.step()
-
-        # outer_loop.set_description(f"Progress (Epoch {ep + 1}/{epochs}) Mode: {Mode}")
-        # if enable_ig_loss:
-        #     outer_loop.set_postfix(
-        #         train_loss=f'{epoch_fnoloss:.2e}',
-        #         ig_loss=f'{epoch_igloss:.2e}',
-        #         val_loss=f'{epoch_valloss:.2e}'
-        #     )
-        # else:
-        #     outer_loop.set_postfix(
-        #         train_loss=f'{epoch_fnoloss:.2e}',
-        #         val_loss=f'{epoch_valloss:.2e}'
-        #     )
-
     cleanup()
 
 
 # %%
 def main(
     enable_ig_loss,
+    save_results,
     topo_path, a_path, u_path,
     train_idx, eval_idx,
     case, num_samples_x_y,
@@ -524,8 +442,8 @@ def main(
 
     model_fn = FNO3d(
         T_in=T_in, T_out=T_out,
-        modes_x=8, modes_y=8, modes_t=8,
-        width=20,
+        modes_x=mode1, modes_y=mode2, modes_t=mode3,
+        width=width_FNO,
         encoder_kernel_size_x=82,
         encoder_kernel_size_y=41,
         encoder_num_layers=4
@@ -564,6 +482,7 @@ def main(
 
             epochs, PATH_saved_models, Mode, num_samples_x_y,
             enable_ig_loss, L_x, L_y, criterion, plot_live_loss,
+            save_results,
             case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx
         ),
         nprocs=world_size,
@@ -578,8 +497,8 @@ def main(
 # %%
 if __name__ == "__main__":
     # System and environment setup
-    # run_nvidia_smi()  # Check GPU status
-    # MHPI()           # Initialize MHPI (if this is a custom function)
+    run_nvidia_smi()  # Check GPU status
+    MHPI()           # Initialize MHPI (if this is a custom function)
     import warnings
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
 
@@ -593,12 +512,13 @@ if __name__ == "__main__":
     case = 'Hurricane_Matthew'
     enable_ig_loss = False  # Enable/disable IG loss
 
+    save_results = True
     # Dataset sizes
     train_size = 300
     eval_size = 150
 
-    train_size = 5
-    eval_size = 5
+    # train_size = 5
+    # eval_size = 5
 
 
     tmp_ds = LargeHydrologyDataset(a_path, u_path)
@@ -639,9 +559,9 @@ if __name__ == "__main__":
     unet_depth = 4
 
     # FNO inputs
-    mode_x = 8
-    mode_y = 8
-    mode_t = 8
+    mode_x = 6
+    mode_y = 6
+    mode_t = 6
     width_FNO = 20
 
     # WNO inputs
@@ -658,7 +578,7 @@ if __name__ == "__main__":
 
     # Call the main function with organized inputs
     main(
-        enable_ig_loss, topo_path, a_path, u_path, train_idx, eval_idx, case, 
+        enable_ig_loss, save_results, topo_path, a_path, u_path, train_idx, eval_idx, case, 
         num_samples_x_y, batch_size, 
         epochs, learning_rate, scheduler_step, scheduler_gamma, 
         operator_type, T_in, T_out, nx=nx, ny=ny,
