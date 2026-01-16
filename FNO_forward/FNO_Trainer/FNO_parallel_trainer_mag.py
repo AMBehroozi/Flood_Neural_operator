@@ -98,7 +98,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     mx = int(nx/magnification_factor)
     my = int(ny/magnification_factor)
     
-    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
+    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.5)
 
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
@@ -153,6 +153,8 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
             u_pad = F.pad(U_pred.detach().permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
             topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
             target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
+
+            Gradient_Accumulation = True
 
             if Gradient_Accumulation:
                 accumulation_steps = 10 
@@ -302,18 +304,23 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
         val_maglosses.append(epoch_val_magloss)
 
         # ---------------- Logging / saving ----------------
-        losses_dict = {
+        losses_dict_main = {
             'Train FNO Loss': train_fnolosses,
-            'Train Mag Loss': train_maglosses,
-            'Val FNO Loss': val_losses,
-            'Val Mag Loss': val_maglosses
+            'Val FNO Loss': val_losses
         }
         if enable_ig_loss:
             losses_dict['Train IG loss'] = train_iglosses
 
-        # Convert to DataFrame for persistence
-        df = pd.DataFrame(losses_dict)
+        losses_dict_magnifier = {
+            'Train Mag Loss': train_maglosses,
+            'Val Mag Loss': val_maglosses
+        }
 
+        # Convert to DataFrame for persistence
+        df_main = pd.DataFrame(losses_dict_main)
+        df_magnifier = pd.DataFrame(losses_dict_magnifier)
+
+        save_results = False
         # Ensure we only save on the primary rank in DDP
         if save_results and (ep % 5 == 0) and (rank == 0):
             torch.save({
@@ -354,7 +361,9 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 'model_state_dict': model.state_dict(),          # Global Model
                 'magnifier_state_dict': magnifier.state_dict(),  # Magnifier Model
                 'optimizer_state_dict': optimizer.state_dict(),  # Shared Optimizer
-                'loss_df': df,                                   # Full loss history
+                'loss_df_main': df_main,                                   # main model loss history
+                'loss_df_magnifier': df_magnifier,                                   # magnifier model loss history
+
             }, PATH_saved_models + f'/saved_model_{Mode}.pth')
             
             print(f"--- Checkpoint saved at Epoch {ep+1} ---")
