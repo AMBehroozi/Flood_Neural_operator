@@ -92,14 +92,14 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     outer_loop = tqdm(range(epochs), desc="Progress", position=0)
     torch.cuda.empty_cache()
     
-    nx = None
-    ny = None
-
+    nx, ny, _ = train_dataset[0][0].shape
     N = 5
     f = magnification_factor
+    mx = int(nx/magnification_factor)
+    my = int(ny/magnification_factor)
+    
+    index_provider = PaddedIndexProvider(mx=mx, my=my, N=5, batch_size=8)
 
-    index_provider = PaddedIndexProvider(mx=82, my=41, N=5, batch_size=16)
-    # Assuming model2, optimizer2, and index_provider are initialized per rank
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
         
@@ -129,9 +129,6 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
             total_samples += bs
             batch_topo = topo.expand(bs, -1, -1) # [bs, nx, ny]
 
-            if nx is None or ny is None:
-                nx, ny = batch_forcing.shape[1:3]
-
             # 1. ─── GLOBAL COARSE PASS (MODEL 1) ───
             optimizer.zero_grad(set_to_none=True)
             
@@ -153,9 +150,9 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 ig_loss = data_loss.new_tensor(0.0)
                 loss1 = data_loss
 
-            # loss1.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # optimizer.step()
+            loss1.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
             # 2. ─── PATCH REFINEMENT PASS (MODEL 2) ───
             # We use a 'detach' on U_pred to train Model 2 independently if desired, 
@@ -201,7 +198,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 
                 mag_loss = criterion(big_out, big_trgt)
                 mag_loss.backward()
-                optimizer2.step()
+                optimizer.step()
                 
                 total_magloss += mag_loss.item() * (bs * len(spatial_batch))
 
@@ -363,7 +360,7 @@ def main(
     )
 
     magnifier_fn = magnifier(
-        in_channels=C_in,
+        in_channels=2,
         base_channels=32,
         num_fno_blocks=4,
         fno_modes_x=6,
