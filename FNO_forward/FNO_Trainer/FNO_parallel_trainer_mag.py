@@ -8,6 +8,7 @@ import torch.optim as optim
 import torch.distributed as dist
 import torch.nn.functional as F
 
+import random  
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -21,16 +22,17 @@ sys.path.append("../../")
 sys.path.append("../")
 sys.path.append("./")
 
-from lib.utilities3 import ensure_directory
+from lib.utilities3 import ensure_directory, check_if_from_ddp, adjust_state_dict
 from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 
 from models.fno3d_encoder import FNO3d
-from models.magnifier import MagnifierModel as magnifier
+# from models.magnifier import MagnifierModel as magnifier
+# from models.magnifier1 import Deep3DMagnifier as magnifier
+from models.magnifier2 import LightMagnifier as magnifier
 
 from lib.helper import LargeHydrologyDataset
 from lib.ddp_helpers import setup, cleanup
 from lib.helper import coarsen_spatial_tensor
-from lib.helper import PaddedIndexProvider, prepare_patch_input
 from lib.util import run_nvidia_smi, MHPI
 
 
@@ -68,15 +70,17 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     else:
         awl = None
         optimizer = optim.Adam(
-            [{'params': model.parameters(), 'lr': learning_rate},
-             {'params': magnifier.parameters(), 'lr': learning_rate}]
+            # [{'params': model.parameters(), 'lr': learning_rate},
+             [{'params': magnifier.parameters(), 'lr': learning_rate}]
         )
 
     scheduler = StepLR(optimizer, step_size=50, gamma=0.85)
 
     # ---- Static topo ----
     topo = torch.load(topo_path, map_location='cpu').to(rank)
-
+    GLOBAL_TOPO_MIN = topo.min()
+    GLOBAL_TOPO_MAX = topo.max()
+    TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
     # ---- Dataset / loaders ----
     full_dataset = LargeHydrologyDataset(a_path, u_path)
     train_dataset = Subset(full_dataset, train_idx)
@@ -102,158 +106,145 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
     mx = int(nx/magnification_factor)
     my = int(ny/magnification_factor)
     
-    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=16, subset_fraction=0.2)
+    # Set subset_fraction=1.0 to ensure we can find all possible wet patches
+    index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=32, subset_fraction=1.0)
 
     for ep in outer_loop:
         train_sampler.set_epoch(ep)
-        
-        model.train()      # Model 1
-        magnifier.train()  # Model 2
+        model.eval()      
+        magnifier.train() 
         
         total_fnoloss = 0.0
         total_igloss  = 0.0
         total_magloss = 0.0
         total_samples = 0
+        
+        # Track total wet patches across the entire epoch for final normalization
+        epoch_total_wet_patches = 0
 
         for batch_data in train_loader:
             batch_data = [item.to(rank) for item in batch_data]
-            
-            # [nb, nx, ny, nt]
             batch_forcing  = batch_data[0]
             batch_u0       = batch_data[1][..., :T_in]
             batch_u_out_hr = batch_data[1][..., T_in:] 
             
             bs = batch_u0.shape[0]
             total_samples += bs
-            batch_topo = topo.expand(bs, -1, -1) # [bs, nx, ny]
+            batch_topo = topo.expand(bs, -1, -1)
 
-            # ---------------------------------------------------------
-            # 1. GLOBAL COARSE PASS (MODEL 1)
-            # ---------------------------------------------------------
+            # --- 1. GLOBAL COARSE PASS ---
             optimizer.zero_grad(set_to_none=True)
-            
-            # Forward pass: [bs, mx, my, T_out]
             U_pred = model(batch_forcing, batch_u0, batch_topo)
+            U_pred[U_pred < 0.025] = 0
             
-            # Coarsen Ground Truth for Loss
             batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
             data_loss = criterion(U_pred, batch_u_out_lr)
             
-            if enable_ig_loss:
-                # ... IG logic stays here ...
-                loss1 = awl(data_loss, ig_loss)
-            else:
-                ig_loss = data_loss.new_tensor(0.0)
-                loss1 = data_loss
-
-            loss1.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step() # Update Model 1 weights
-
-            # ---------------------------------------------------------
-            # 2. PATCH REFINEMENT PASS (MAGNIFIER)
-            # ---------------------------------------------------------
-            # Use .detach() to ensure Model 1 gradients don't accumulate in the spatial loop
+            # --- 2. PATCH REFINEMENT (MAGNIFIER) with Quota-Based Sampling ---
             u_pad = F.pad(U_pred.detach().permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
+            
+            batch_topo = (batch_topo - GLOBAL_TOPO_MIN) / TOPO_RANGE
+
             topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
             target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
 
-            Gradient_Accumulation = True
+            DRY_THRESHOLD = 0.025
+            WET_BATCH_QUOTA = 21  # Stop after processing 20 wet spatial batches
+            wet_batches_processed = 0
+            
+            # Shuffle spatial batches each time to see different parts of the flood
+            all_batches = list(index_provider.get_batches())
+            random.shuffle(all_batches) 
 
-            if Gradient_Accumulation:
-                accumulation_steps = 10 
-                optimizer.zero_grad(set_to_none=True) 
+            accumulation_steps = 3 
+            optimizer.zero_grad(set_to_none=True) 
+            actual_accumulation_count = 0
 
-                # spatial_batch is a subset based on index_provider.subset_fraction
-                for i, spatial_batch in enumerate(index_provider.get_batches()):
-                    batch_patches_in = []
-                    batch_patches_trgt = []
+            for i, spatial_batch in enumerate(all_batches):
+                # Stop if we have reached our quota for this temporal batch
+                if wet_batches_processed >= WET_BATCH_QUOTA:
+                    break
 
-                    for (i_s, j_s) in spatial_batch:
-                        # [bs, 2, Pf, Pf, T_out]
-                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
-                        # [bs, 1, Pf, Pf, T_out]
-                        p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)              
-                        
-                        batch_patches_in.append(p_in)
-                        batch_patches_trgt.append(p_target)
+                batch_patches_in = []
+                batch_patches_trgt = []
 
-                    # [bs * nb_i, 2, Pf, Pf, T_out]
-                    big_in = torch.cat(batch_patches_in, dim=0)
-                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
-
-                    big_out = magnifier(big_in)
+                for (i_s, j_s) in spatial_batch:
+                    # Check Target for wetness
+                    p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
                     
-                    # Mean loss over virtual batch
-                    mag_loss_batch = criterion(big_out, big_trgt) / accumulation_steps
-                    mag_loss_batch.backward()
-                    
-                    if (i + 1) % accumulation_steps == 0:
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                    
-                    total_magloss += (mag_loss_batch.item() * accumulation_steps) * (bs * len(spatial_batch))
+                    if p_target.max() < DRY_THRESHOLD:
+                        continue 
 
-                # Final step for leftovers
-                if (i + 1) % accumulation_steps != 0:
+                    p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
+                    batch_patches_in.append(p_in)
+                    batch_patches_trgt.append(p_target)
+
+                # Skip if no wet patches in this spatial batch
+                if not batch_patches_in:
+                    continue
+
+                # Forward/Backward on wet patches
+                big_in = torch.cat(batch_patches_in, dim=0)
+                big_trgt = torch.cat(batch_patches_trgt, dim=0)
+                big_out = magnifier(big_in)
+                
+                # Use current wet batch count for loss normalization
+                num_wet_in_batch = len(batch_patches_in)
+                mag_loss_batch = criterion(big_out, big_trgt) / accumulation_steps
+                mag_loss_batch.backward()
+                torch.nn.utils.clip_grad_norm_(magnifier.parameters(), max_norm=0.5)
+                # Update Counters
+                actual_accumulation_count += 1
+                wet_batches_processed += 1
+                
+                # Accumulate raw loss for metrics (un-normalized by accumulation_steps)
+                # We multiply by (bs * num_wet_in_batch) for weighted average later
+                total_magloss += (mag_loss_batch.item() * accumulation_steps) * (bs * num_wet_in_batch)
+                epoch_total_wet_patches += (bs * num_wet_in_batch)
+
+                # Step optimizer at accumulation interval or if we hit quota early
+                if actual_accumulation_count % accumulation_steps == 0 or wet_batches_processed == WET_BATCH_QUOTA:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    actual_accumulation_count = 0
 
-            else:
-                # Standard Step-by-Step Refinement
-                for spatial_batch in index_provider.get_batches():
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    batch_patches_in = []
-                    batch_patches_trgt = []
-
-                    for (i_s, j_s) in spatial_batch:
-                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
-                        p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)              
-                        batch_patches_in.append(p_in)
-                        batch_patches_trgt.append(p_target)
-
-                    big_in = torch.cat(batch_patches_in, dim=0)
-                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
-
-                    big_out = magnifier(big_in)
-                    mag_loss = criterion(big_out, big_trgt)
-                    mag_loss.backward()
-                    optimizer.step()
-                    
-                    total_magloss += mag_loss.item() * (bs * len(spatial_batch))
-
-            # Accumulate metrics
+            # Final metrics accumulation for global model
             total_fnoloss += data_loss.item() * bs
-            total_igloss  += ig_loss.item() * bs
+            total_igloss  += (ig_loss.item() if enable_ig_loss else 0.0) * bs
 
-        # Final Epoch Statistics
-        # Note: Use num_subset because that is how many windows we actually processed
+        # --- 3. Final Epoch Statistics ---
         epoch_fnoloss = total_fnoloss / total_samples
-        epoch_magloss = total_magloss / (total_samples * index_provider.num_subset)
+        
+        # Normalize magnifier loss only by the number of wet patches actually seen
+        if epoch_total_wet_patches > 0:
+            epoch_magloss = total_magloss / epoch_total_wet_patches
+        else:
+            epoch_magloss = 0.0
 
         train_losses.append(epoch_fnoloss)
         train_maglosses.append(epoch_magloss)
 
-        
-        # ---------------- Evaluation phase ----------------
+
+        # ---------------------------------------------------------
+        # 3. EVALUATION PHASE (Consistency with Dry Filter)
+        # ---------------------------------------------------------
         model.eval()
         magnifier.eval()
         
         total_valloss = 0.0
         total_val_magloss = 0.0
         total_val_samples = 0
+        total_val_wet_patches = 0  # CRITICAL: Track wet patches for correct normalization
 
-        # We use a non-randomized, full systematic sweep for validation 
-        # to get a stable, reproducible score (subset_fraction=1.0)
+        # Consistent configuration: Sample 20% of the domain for validation speed
         val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
+        val_batches = list(val_index_provider.get_batches())
 
         with torch.no_grad():
             for batch_data in eval_loader:
                 batch_data = [item.to(rank) for item in batch_data]
 
-                # batch_forcing: [bs, nx, ny, nt]
-                # batch_u_out_hr: [bs, nx, ny, T_out]
+                # Extract Coarse and HR targets
                 batch_forcing  = batch_data[0]
                 batch_u0       = batch_data[1][..., :T_in]
                 batch_u_out_hr = batch_data[1][..., T_in:]
@@ -262,132 +253,116 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 total_val_samples += bs
                 batch_topo = topo.expand(bs, -1, -1)
 
-                # 1. ─── Model 1 Validation (Global Coarse) ───
-                # U_pred: [bs, mx, my, T_out]
+                # --- Model 1 Validation (Global Coarse) ---
                 U_pred = model(batch_forcing, batch_u0, batch_topo)
-                
-                # Coarsen ground truth to match global model resolution
                 batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
                 val_loss = criterion(U_pred, batch_u_out_lr)
                 total_valloss += val_loss.item() * bs
 
-                # 2. ─── Magnifier Validation (Local Refinement) ───
-                # Prepare padded tensors for full-domain sweep
+                # --- Magnifier Validation (Local Refinement) ---
+                # Prepare padded buffers for the spatial sweep
                 u_pad = F.pad(U_pred.permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
+                
+                batch_topo = (batch_topo - GLOBAL_TOPO_MIN) / TOPO_RANGE
+
                 topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
                 target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
 
-                # Loop through ALL windows in the domain for a complete high-res assessment
-                for spatial_batch in val_index_provider.get_batches():
+                for spatial_batch in val_batches:
                     batch_patches_in = []
                     batch_patches_trgt = []
 
                     for (i_s, j_s) in spatial_batch:
-                        # Extract and prepare input: [bs, 2, Pf, Pf, T_out]
-                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
-                        # Extract target patch: [bs, 1, Pf, Pf, T_out]
+                        # Slice Target first to verify wetness
                         p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
                         
+                        # Apply same physics-based filter used in training
+                        if p_target.max() < DRY_THRESHOLD:
+                            continue
+
+                        # Extract input for wet regions only
+                        p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
                         batch_patches_in.append(p_in)
                         batch_patches_trgt.append(p_target)
 
-                    # Flatten batch: [bs * batch_size, ...]
-                    big_in = torch.cat(batch_patches_in, dim=0)
-                    big_trgt = torch.cat(batch_patches_trgt, dim=0)
+                    if batch_patches_in:
+                        big_in = torch.cat(batch_patches_in, dim=0)
+                        big_trgt = torch.cat(batch_patches_trgt, dim=0)
 
-                    # Magnifier prediction
-                    big_out = magnifier(big_in)
-                    mag_val_loss = criterion(big_out, big_trgt)
-                    
-                    # Accumulate loss based on number of patches in this spatial batch
-                    total_val_magloss += mag_val_loss.item() * (bs * len(spatial_batch))
+                        # Predict refined water depth
+                        big_out = magnifier(big_in)
+                        mag_val_loss = criterion(big_out, big_trgt)
+                        
+                        num_wet = len(batch_patches_in)
+                        total_val_magloss += mag_val_loss.item() * (bs * num_wet)
+                        total_val_wet_patches += (bs * num_wet)
 
-        # 3. ─── Metrics Normalization ───
+        # --- Metrics Normalization ---
         epoch_valloss = total_valloss / total_val_samples
         
-        # total_val_magloss is divided by (total_samples * total_spatial_windows)
-        epoch_val_magloss = total_val_magloss / (total_val_samples * val_index_provider.num_total_windows)
+        # Avoid division by zero if an entire validation set is dry
+        epoch_val_magloss = total_val_magloss / total_val_wet_patches if total_val_wet_patches > 0 else 0.0
         
         val_losses.append(epoch_valloss)
         val_maglosses.append(epoch_val_magloss)
 
-        # ---------------- Logging / saving ----------------
+        # ---------------------------------------------------------
+        # 4. LOGGING AND CHECKPOINTING
+        # ---------------------------------------------------------
         losses_dict_main = {
             'Train FNO Loss': train_losses,
             'Val FNO Loss': val_losses
         }
         if enable_ig_loss:
-            losses_dict['Train IG loss'] = train_iglosses
+            losses_dict_main['Train IG loss'] = train_iglosses
 
         losses_dict_magnifier = {
             'Train Mag Loss': train_maglosses,
             'Val Mag Loss': val_maglosses
         }
 
-        # Convert to DataFrame for persistence
+        # Convert to DataFrames for persistence
         df_main = pd.DataFrame(losses_dict_main)
         df_magnifier = pd.DataFrame(losses_dict_magnifier)
 
-        # Ensure we only save on the primary rank in DDP
+        # Save Checkpoint (Only on rank 0 for DDP)
         if save_results and (ep % 5 == 0) and (rank == 0):
-            torch.save({
+            checkpoint_data = {
                 'config': {
-                    # --- Original Model 1 Config ---
+                    # Model 1 Architecture
                     'operator_type': operator_type,
-                    'enable_ig_loss': enable_ig_loss,
-                    'Nx': nx,
-                    'Ny': ny,
-                    'T_in': T_in,
-                    'T_out': T_out,
-                    'width_CNO': width_CNO,
-                    'depth_CNO': depth_CNO,
-                    'kernel_size': kernel_size,
-                    'unet_depth': unet_depth,
-                    'mode1': mode1,
-                    'mode2': mode2,
-                    'mode3': mode3,
-                    'width_FNO': width_FNO,
-                    'wavelet': wavelet,
-                    'level': level,
-                    'layers': layers,
-                    'grid_range': grid_range,
-                    'width_WNO': width_WNO,
-                    'branch_layers': branch_layers,
-                    'trunk_layers': trunk_layers,
+                    'Nx': nx, 'Ny': ny,
+                    'T_in': T_in, 'T_out': T_out,
                     
-                    # --- New Magnifier / Refinement Config ---
-                    'mx_coarse': mx,
-                    'my_coarse': my,
-                    'N_window': N,           # Coarse window size (e.g., 5)
-                    'f_upscale': f,          # Magnification factor (e.g., 10)
-                    'Pf_fine': N * f,        # Resulting fine patch size
-                    'subset_fraction': 0.2,  # Plan 1: Stochastic subsampling %
-                    'accumulation_steps': 10 if Gradient_Accumulation else 1 # Plan 2
+                    # Magnifier / Refinement Metadata
+                    'mx_coarse': mx, 'my_coarse': my,
+                    'N_window': N,           # Coarse patch size (5x5)
+                    'f_upscale': f,          # Upscale factor (10x)
+                    'Pf_fine': N * f,        # High-res output size (50x50)
+                    'dry_threshold': DRY_THRESHOLD,
+                    'accumulation_steps': accumulation_steps
                 },
                 'epoch': ep,
-                'model_state_dict': model.state_dict(),          # Global Model
-                'magnifier_state_dict': magnifier.state_dict(),  # Magnifier Model
-                'optimizer_state_dict': optimizer.state_dict(),  # Shared Optimizer
-                'loss_df_main': df_main,                                   # main model loss history
-                'loss_df_magnifier': df_magnifier,                                   # magnifier model loss history
+                'model_state_dict': model.state_dict(),
+                'magnifier_state_dict': magnifier.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss_df_main': df_main,
+                'loss_df_magnifier': df_magnifier,
+            }
+            torch.save(checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}.pth")
+            print(f"\n[Checkpoint] Saved Epoch {ep+1} on Rank 0")
 
-            }, PATH_saved_models + f'/saved_model_{Mode}.pth')
-            
-            print(f"--- Checkpoint saved at Epoch {ep+1} ---")
-
-        # Live Plotting
-        if plot_live_loss and (rank == 0):
-            loss_live_plot(losses_dict)
-
+        # Step Scheduler
         scheduler.step()
 
-        # Update Progress Bar with current results
-        outer_loop.set_description(f"Epoch {ep + 1}/{epochs}")
-        outer_loop.set_postfix(
-            fno_v=f'{epoch_valloss:.2e}',
-            mag_v=f'{epoch_val_magloss:.2e}',
-            mag_t=f'{epoch_magloss:.2e}' # From training phase
-        )
+        # Update Progress Bar with current Metrics
+        if rank == 0:
+            outer_loop.set_description(f"Epoch {ep + 1}/{epochs}")
+            outer_loop.set_postfix(
+                fno_v=f'{epoch_valloss:.2e}',
+                mag_v=f'{epoch_val_magloss:.2e}',
+                mag_t=f'{epoch_magloss:.2e}' # Training loss from previous section
+            )
 
 
     cleanup()
@@ -440,30 +415,50 @@ def main(
     # Best practice is to construct the model inside each rank (in train_model),
     # but keeping your current pattern for now.
 
+    # model_fn = FNO3d(
+    #     T_in=T_in, T_out=T_out,
+    #     modes_x=mode1, modes_y=mode2, modes_t=mode3,
+    #     width=width_FNO,
+    #     encoder_kernel_size_x=82,
+    #     encoder_kernel_size_y=41,
+    #     encoder_num_layers=4
+    # )
+    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse3_FNO_DDP_300.pth'
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            
+    is_DDP = check_if_from_ddp(checkpoint)
     model_fn = FNO3d(
         T_in=T_in, T_out=T_out,
-        modes_x=mode1, modes_y=mode2, modes_t=mode3,
-        width=width_FNO,
+        modes_x=checkpoint['config']['mode1'], 
+        modes_y=checkpoint['config']['mode2'], 
+        modes_t=checkpoint['config']['mode3'],
+        width=checkpoint['config']['width_FNO'],
         encoder_kernel_size_x=82,
         encoder_kernel_size_y=41,
         encoder_num_layers=4
     )
+        
+    if is_DDP:   
+        adjusted_state_dict = adjust_state_dict(checkpoint['model_state_dict'], model_fn)
+        model_fn.load_state_dict(adjusted_state_dict)
+    else:
+        model_fn.load_state_dict(checkpoint['model_state_dict'])
 
-    magnifier_fn = magnifier(
-        in_channels=2,
-        base_channels=32,
-        num_fno_blocks=4,
-        fno_modes_x=6,
-        fno_modes_y=6,
-        num_refinement_blocks=4,
-        num_residual_per_block=3,
-        channel_multipliers=[1.0, 1.5, 2, 2],  # 48→64→80→96→96
-        dropout=0.1,
-        use_attention=False,
-        use_pyramid_pooling=True,
-        use_gradient_checkpointing=False
-    )
-
+    # magnifier_fn = magnifier(
+    #     in_channels=2,
+    #     base_channels=32,
+    #     num_fno_blocks=4,
+    #     fno_modes_x=6,
+    #     fno_modes_y=6,
+    #     num_refinement_blocks=4,
+    #     num_residual_per_block=3,
+    #     channel_multipliers=[1.0, 1.5, 2, 2],  # 48→64→80→96→96
+    #     dropout=0.1,
+    #     use_attention=False,
+    #     use_pyramid_pooling=True,
+    #     use_gradient_checkpointing=False
+    # )
+    magnifier_fn = magnifier(width=32)
     # Only needed if IG is enabled (still safe to create)
     ss = 2 if enable_ig_loss else 1
     awl_fn = AutomaticWeightedLoss(ss)
@@ -514,7 +509,7 @@ if __name__ == "__main__":
 
     save_results = True
     # Dataset sizes
-    train_size = 300
+    train_size = 100
     eval_size = 150
 
     # train_size = 5
@@ -532,12 +527,12 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    num_samples_x_y = 'test_mag'  # Number of random samples along x, y axes for Jacobian calculations
+    num_samples_x_y = 'test_mag3'  # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
-    batch_size = 2
+    batch_size = 4
     epochs = 500
-    learning_rate = 0.005
+    learning_rate = 0.001
     scheduler_step = 100
     scheduler_gamma = 0.95
 
@@ -551,6 +546,7 @@ if __name__ == "__main__":
 
     nx = 328
     ny = 164
+
     magnification_factor = 4
     # Model-specific inputs
     # CNO inputs
