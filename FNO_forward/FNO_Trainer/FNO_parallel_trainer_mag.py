@@ -36,7 +36,9 @@ from lib.helper import coarsen_spatial_tensor
 from lib.util import run_nvidia_smi, MHPI
 
 
-def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate, 
+def train_model(rank, world_size, 
+                training_mode,
+                model_fn, magnifier_fn, awl_fn, learning_rate, 
                 operator_type, T_in, T_out,
                 magnification_factor,
                 width_CNO, depth_CNO, kernel_size, unet_depth,  # CNO inputs
@@ -44,7 +46,7 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                 wavelet, level, layers, grid_range, width_WNO,  # WNO inputs
                 branch_layers, trunk_layers,                    # DeepONet inputs
 
-                epochs, PATH_saved_models, Mode, num_samples_x_y, 
+                epochs, PATH_saved_models, Mode, tag, 
                 enable_ig_loss, L_x, L_y, criterion, plot_live_loss,
                 save_results, 
                 case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx):
@@ -373,9 +375,12 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
 def main(
     enable_ig_loss,
     save_results,
+    global_checkpoint_path,
+    mag_checkpoint_path,
+    training_mode,
     topo_path, a_path, u_path,
     train_idx, eval_idx,
-    case, num_samples_x_y,
+    case, tag,
     batch_size, epochs, learning_rate,
     scheduler_step, scheduler_gamma,
     operator_type, T_in, T_out, nx, ny,
@@ -401,7 +406,7 @@ def main(
     Mode = (
         f"{case}_{'IG_Enable' if enable_ig_loss else 'IG_Disable'}"
         f"_Nx_{nx}_Ny_{ny}_Tin_{T_in}_Tout_{T_out}"
-        f"_Samp_{num_samples_x_y}_{operator_type}"
+        f"_Samp_{tag}_{operator_type}"
         f"_DDP_{train_size}"
     )
     print(f"Mode: {Mode}")
@@ -411,31 +416,67 @@ def main(
     PATH_saved_models = os.path.join(main_path, "saved_models")
     ensure_directory(PATH_saved_models)
 
-
-    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            
-    is_DDP = check_if_from_ddp(checkpoint)
-    model_fn = FNO3d(
-        T_in=T_in, T_out=T_out,
-        modes_x=checkpoint['config']['mode1'], 
-        modes_y=checkpoint['config']['mode2'], 
-        modes_t=checkpoint['config']['mode3'],
-        width=checkpoint['config']['width_FNO'],
-        encoder_kernel_size_x=82,
-        encoder_kernel_size_y=41,
-        encoder_num_layers=4
-    )
+    if global_checkpoint_path != None:
+        checkpoint = torch.load(global_checkpoint_path, map_location='cpu', weights_only=False)
         
-    if is_DDP:   
-        adjusted_state_dict = adjust_state_dict(checkpoint['model_state_dict'], model_fn)
-        model_fn.load_state_dict(adjusted_state_dict)
+        # Extract configuration from checkpoint
+        config = checkpoint['config']
+        m1, m2, m3 = config['mode1'], config['mode2'], config['mode3']
+        width_val = config['width_FNO']
+        
+        # Initialize and load weights
+        model_fn = FNO3d(
+            T_in=T_in, T_out=T_out,
+            modes_x=m1, modes_y=m2, modes_t=m3,
+            width=width_val,
+            encoder_kernel_size_x=82,
+            encoder_kernel_size_y=41,
+            encoder_num_layers=4
+        )
+
+        state_dict = checkpoint['model_state_dict']
+        if check_if_from_ddp(checkpoint):   
+            state_dict = adjust_state_dict(state_dict, model_fn)
+        model_fn.load_state_dict(state_dict)
+
     else:
-        model_fn.load_state_dict(checkpoint['model_state_dict'])
+        # Initialize with default/global variables if no checkpoint is used
+        model_fn = FNO3d(
+            T_in=T_in, T_out=T_out,
+            modes_x=mode1, # Uses variables defined elsewhere in your script
+            modes_y=mode2, 
+            modes_t=mode3,
+            width=width_FNO,
+            encoder_kernel_size_x=82,
+            encoder_kernel_size_y=41,
+            encoder_num_layers=4
+        )
+        
+    model_fn = model_fn.to(device)
 
 
+    if mag_checkpoint_path != None:
+        # Path to your specific magnifier checkpoint
+        mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
+        checkpoint_mag = torch.load(mag_checkpoint_path, map_location='cpu', weights_only=False)
+        
+        # Initialize magnifier architecture
+        magnifier_fn = magnifier(width=32)
+        
+        # Extract state dict (using the specific key for magnifier weights)
+        state_dict_mag = checkpoint_mag['magnifier_state_dict']
+        
+        # Handle DDP state dict adjustment
+        if check_if_from_ddp(checkpoint_mag):
+            state_dict_mag = adjust_state_dict(state_dict_mag, magnifier_fn)
+            
+        magnifier_fn.load_state_dict(state_dict_mag)
 
-    magnifier_fn = magnifier(width=32)
+    else:
+        # Fresh initialization for the magnifier
+        magnifier_fn = magnifier(width=32)
+
+    magnifier_fn = magnifier_fn.to(device)
 
 
     # Only needed if IG is enabled (still safe to create)
@@ -446,7 +487,10 @@ def main(
     torch.multiprocessing.spawn(
         train_model,
         args=(
-            world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
+            world_size, 
+            training_mode, 
+            model_fn, magnifier_fn, awl_fn, 
+            learning_rate,
             operator_type, T_in, T_out,
             magnification_factor,
             width_CNO, depth_CNO, kernel_size, unet_depth,
@@ -454,7 +498,7 @@ def main(
             wavelet, level, layers, grid_range, width_WNO,
             branch_layers, trunk_layers,
 
-            epochs, PATH_saved_models, Mode, num_samples_x_y,
+            epochs, PATH_saved_models, Mode, tag,
             enable_ig_loss, L_x, L_y, criterion, plot_live_loss,
             save_results,
             case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx
@@ -494,6 +538,16 @@ if __name__ == "__main__":
     # train_size = 5
     # eval_size = 5
 
+    # NOTE: If this path be None, code creat new raw models 
+    mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
+    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+
+    # --- Training Configuration ---
+    # Stage 1: Pre-train Global Model (FNO) only
+    # Stage 2: Freeze Global Model, Pre-train Magnifier only
+    # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
+    training_mode = 'Stage3'
+
 
     tmp_ds = LargeHydrologyDataset(a_path, u_path)
     # 2. Split with a fixed generator for reproducibility
@@ -506,7 +560,7 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    num_samples_x_y = 'test_mag3'  # Number of random samples along x, y axes for Jacobian calculations
+    tag = 'test_mag_fine_tuned'  # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
     batch_size = 4
@@ -553,8 +607,12 @@ if __name__ == "__main__":
 
     # Call the main function with organized inputs
     main(
-        enable_ig_loss, save_results, topo_path, a_path, u_path, train_idx, eval_idx, case, 
-        num_samples_x_y, batch_size, 
+        enable_ig_loss, save_results, 
+        global_checkpoint_path,
+        mag_checkpoint_path,
+        training_mode,
+        topo_path, a_path, u_path, train_idx, eval_idx, case, 
+        tag, batch_size, 
         epochs, learning_rate, scheduler_step, scheduler_gamma, 
         operator_type, T_in, T_out, nx=nx, ny=ny,
         magnification_factor=magnification_factor, 
