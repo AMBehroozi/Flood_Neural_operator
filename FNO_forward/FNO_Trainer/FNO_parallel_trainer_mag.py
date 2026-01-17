@@ -333,7 +333,8 @@ def train_model(rank, world_size, model_fn, magnifier_fn, awl_fn, learning_rate,
                     'operator_type': operator_type,
                     'Nx': nx, 'Ny': ny,
                     'T_in': T_in, 'T_out': T_out,
-                    
+                    'Mode1_G':mode1, 'Mode2_G': mode2, 'Mode3_G': mode3, 'width_FNO': width_FNO,
+
                     # Magnifier / Refinement Metadata
                     'mx_coarse': mx, 'my_coarse': my,
                     'N_window': N,           # Coarse patch size (5x5)
@@ -410,20 +411,8 @@ def main(
     PATH_saved_models = os.path.join(main_path, "saved_models")
     ensure_directory(PATH_saved_models)
 
-    # Model + loss
-    # IMPORTANT: passing a *model instance* into spawn can cause pickling issues.
-    # Best practice is to construct the model inside each rank (in train_model),
-    # but keeping your current pattern for now.
 
-    # model_fn = FNO3d(
-    #     T_in=T_in, T_out=T_out,
-    #     modes_x=mode1, modes_y=mode2, modes_t=mode3,
-    #     width=width_FNO,
-    #     encoder_kernel_size_x=82,
-    #     encoder_kernel_size_y=41,
-    #     encoder_num_layers=4
-    # )
-    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse3_FNO_DDP_300.pth'
+    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
             
     is_DDP = check_if_from_ddp(checkpoint)
@@ -444,21 +433,11 @@ def main(
     else:
         model_fn.load_state_dict(checkpoint['model_state_dict'])
 
-    # magnifier_fn = magnifier(
-    #     in_channels=2,
-    #     base_channels=32,
-    #     num_fno_blocks=4,
-    #     fno_modes_x=6,
-    #     fno_modes_y=6,
-    #     num_refinement_blocks=4,
-    #     num_residual_per_block=3,
-    #     channel_multipliers=[1.0, 1.5, 2, 2],  # 48→64→80→96→96
-    #     dropout=0.1,
-    #     use_attention=False,
-    #     use_pyramid_pooling=True,
-    #     use_gradient_checkpointing=False
-    # )
+
+
     magnifier_fn = magnifier(width=32)
+
+
     # Only needed if IG is enabled (still safe to create)
     ss = 2 if enable_ig_loss else 1
     awl_fn = AutomaticWeightedLoss(ss)
