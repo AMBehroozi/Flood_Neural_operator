@@ -30,7 +30,7 @@ from models.fno3d_encoder import FNO3d
 # from models.magnifier1 import Deep3DMagnifier as magnifier
 from models.magnifier2 import LightMagnifier as magnifier
 
-from lib.helper import LargeHydrologyDataset
+from lib.helper import LargeHydrologyDataset, PaddedIndexProvider, prepare_patch_input   
 from lib.ddp_helpers import setup, cleanup
 from lib.helper import coarsen_spatial_tensor
 from lib.util import run_nvidia_smi, MHPI
@@ -53,30 +53,41 @@ def train_model(rank, world_size,
     
     setup(rank, world_size)
 
-    # ---- Model + DDP ----
-    model = model_fn.to(rank)  # ideally model_fn is a fresh instance per rank
+
+# ---- Model + DDP ----
+    model = model_fn.to(rank)
     magnifier = magnifier_fn.to(rank)
-   
+
+    # Apply DDP to both
     model = DDP(model, device_ids=[rank])
     magnifier = DDP(magnifier, device_ids=[rank])
- 
-    # ---- Optimizer (AWL only if IG enabled) ----
-    if enable_ig_loss:
-        awl = awl_fn.to(rank)
-        awl = DDP(awl, device_ids=[rank])
-        optimizer = optim.Adam(
-            [{'params': model.parameters(), 'lr': learning_rate},
-             {'params': magnifier.parameters(), 'lr': learning_rate},
-             {'params': awl.parameters(),   'lr': learning_rate}]
-        )
-    else:
-        awl = None
-        optimizer = optim.Adam(
-            # [{'params': model.parameters(), 'lr': learning_rate},
-             [{'params': magnifier.parameters(), 'lr': learning_rate}]
-        )
 
+    param_groups = []
+
+    if training_mode == 'Stage1':   # Only Global Model
+        
+        print('Stage 1: Pre-train Global Model (FNO) only')
+        param_groups.append({'params': model.parameters(), 'lr': learning_rate})
+        
+    elif training_mode == 'Stage2': # Only Magnifier (Freeze Global)
+        print('Stage 2: Freeze Global Model, Pre-train Magnifier only')
+       
+        param_groups.append({'params': magnifier.parameters(), 'lr': learning_rate})
+        
+    elif training_mode == 'Stage3': # Joint Fine-tuning: Both models
+        print('Stage 3: End-to-End Fine-tuning of Global + Magnifier together')
+        param_groups.append({'params': model.parameters(), 'lr': learning_rate * 0.1}) 
+        param_groups.append({'params': magnifier.parameters(), 'lr': learning_rate})
+
+    else:
+        # Exit Scenario: Invalid training_mode provided
+        raise ValueError(f"Invalid training_mode: '{training_mode}'. "
+                         "Must be 'Stage1', 'Stage2', or 'Stage3'.")
+
+    # ---- Optimizer & Scheduler ----
+    optimizer = optim.Adam(param_groups)
     scheduler = StepLR(optimizer, step_size=50, gamma=0.85)
+
 
     # ---- Static topo ----
     topo = torch.load(topo_path, map_location='cpu').to(rank)
@@ -96,7 +107,7 @@ def train_model(rank, world_size,
     eval_loader  = DataLoader(eval_dataset,  batch_size=batch_size, sampler=eval_sampler,  drop_last=False)
 
     # ---- Logs ----
-    train_fnolosses, train_iglosses, val_losses, val_maglosses  = [], [], [], []
+    train_fnolosses, val_losses, val_maglosses  = [], [], []
     train_losses, train_maglosses = [], []
 
     outer_loop = tqdm(range(epochs), desc="Progress", position=0)
@@ -111,263 +122,207 @@ def train_model(rank, world_size,
     # Set subset_fraction=1.0 to ensure we can find all possible wet patches
     index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=32, subset_fraction=1.0)
 
+
+    DRY_THRESHOLD = 0.025
+    WET_BATCH_QUOTA = 21
+    wet_batches_processed = 0
+    accumulation_steps = 3 
+    actual_accumulation_count = 0
+
     for ep in outer_loop:
-        train_sampler.set_epoch(ep)
-        model.eval()      
-        magnifier.train() 
-        
-        total_fnoloss = 0.0
-        total_igloss  = 0.0
-        total_magloss = 0.0
-        total_samples = 0
-        
-        # Track total wet patches across the entire epoch for final normalization
-        epoch_total_wet_patches = 0
-
-        for batch_data in train_loader:
-            batch_data = [item.to(rank) for item in batch_data]
-            batch_forcing  = batch_data[0]
-            batch_u0       = batch_data[1][..., :T_in]
-            batch_u_out_hr = batch_data[1][..., T_in:] 
+            train_sampler.set_epoch(ep)
             
-            bs = batch_u0.shape[0]
-            total_samples += bs
-            batch_topo = topo.expand(bs, -1, -1)
-
-            # --- 1. GLOBAL COARSE PASS ---
-            optimizer.zero_grad(set_to_none=True)
-            U_pred = model(batch_forcing, batch_u0, batch_topo)
-            U_pred[U_pred < 0.025] = 0
+            # --- 1. SET TRAINING MODES BASED ON STAGE ---
+            if training_mode == 'Stage1':
+                model.train()
+                magnifier.eval()
+            elif training_mode == 'Stage2':
+                model.eval()     # Freeze global model
+                magnifier.train()
+            elif training_mode == 'Stage3':
+                model.train()    # Joint end-to-end training
+                magnifier.train()
             
-            batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
-            data_loss = criterion(U_pred, batch_u_out_lr)
-            
-            # --- 2. PATCH REFINEMENT (MAGNIFIER) with Quota-Based Sampling ---
-            u_pad = F.pad(U_pred.detach().permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
-            
-            batch_topo = (batch_topo - GLOBAL_TOPO_MIN) / TOPO_RANGE
+            total_fnoloss = 0.0
+            total_magloss = 0.0
+            total_samples = 0
+            epoch_total_wet_patches = 0
 
-            topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
-            target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
-
-            DRY_THRESHOLD = 0.025
-            WET_BATCH_QUOTA = 21  # Stop after processing 20 wet spatial batches
-            wet_batches_processed = 0
-            
-            # Shuffle spatial batches each time to see different parts of the flood
-            all_batches = list(index_provider.get_batches())
-            random.shuffle(all_batches) 
-
-            accumulation_steps = 3 
-            optimizer.zero_grad(set_to_none=True) 
-            actual_accumulation_count = 0
-
-            for i, spatial_batch in enumerate(all_batches):
-                # Stop if we have reached our quota for this temporal batch
-                if wet_batches_processed >= WET_BATCH_QUOTA:
-                    break
-
-                batch_patches_in = []
-                batch_patches_trgt = []
-
-                for (i_s, j_s) in spatial_batch:
-                    # Check Target for wetness
-                    p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
-                    
-                    if p_target.max() < DRY_THRESHOLD:
-                        continue 
-
-                    p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
-                    batch_patches_in.append(p_in)
-                    batch_patches_trgt.append(p_target)
-
-                # Skip if no wet patches in this spatial batch
-                if not batch_patches_in:
-                    continue
-
-                # Forward/Backward on wet patches
-                big_in = torch.cat(batch_patches_in, dim=0)
-                big_trgt = torch.cat(batch_patches_trgt, dim=0)
-                big_out = magnifier(big_in)
-                
-                # Use current wet batch count for loss normalization
-                num_wet_in_batch = len(batch_patches_in)
-                mag_loss_batch = criterion(big_out, big_trgt) / accumulation_steps
-                mag_loss_batch.backward()
-                torch.nn.utils.clip_grad_norm_(magnifier.parameters(), max_norm=0.5)
-                # Update Counters
-                actual_accumulation_count += 1
-                wet_batches_processed += 1
-                
-                # Accumulate raw loss for metrics (un-normalized by accumulation_steps)
-                # We multiply by (bs * num_wet_in_batch) for weighted average later
-                total_magloss += (mag_loss_batch.item() * accumulation_steps) * (bs * num_wet_in_batch)
-                epoch_total_wet_patches += (bs * num_wet_in_batch)
-
-                # Step optimizer at accumulation interval or if we hit quota early
-                if actual_accumulation_count % accumulation_steps == 0 or wet_batches_processed == WET_BATCH_QUOTA:
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    actual_accumulation_count = 0
-
-            # Final metrics accumulation for global model
-            total_fnoloss += data_loss.item() * bs
-            total_igloss  += (ig_loss.item() if enable_ig_loss else 0.0) * bs
-
-        # --- 3. Final Epoch Statistics ---
-        epoch_fnoloss = total_fnoloss / total_samples
-        
-        # Normalize magnifier loss only by the number of wet patches actually seen
-        if epoch_total_wet_patches > 0:
-            epoch_magloss = total_magloss / epoch_total_wet_patches
-        else:
-            epoch_magloss = 0.0
-
-        train_losses.append(epoch_fnoloss)
-        train_maglosses.append(epoch_magloss)
-
-
-        # ---------------------------------------------------------
-        # 3. EVALUATION PHASE (Consistency with Dry Filter)
-        # ---------------------------------------------------------
-        model.eval()
-        magnifier.eval()
-        
-        total_valloss = 0.0
-        total_val_magloss = 0.0
-        total_val_samples = 0
-        total_val_wet_patches = 0  # CRITICAL: Track wet patches for correct normalization
-
-        # Consistent configuration: Sample 20% of the domain for validation speed
-        val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
-        val_batches = list(val_index_provider.get_batches())
-
-        with torch.no_grad():
-            for batch_data in eval_loader:
+            # --- 2. TRAINING BATCH LOOP ---
+            for batch_data in train_loader:
                 batch_data = [item.to(rank) for item in batch_data]
-
-                # Extract Coarse and HR targets
                 batch_forcing  = batch_data[0]
                 batch_u0       = batch_data[1][..., :T_in]
-                batch_u_out_hr = batch_data[1][..., T_in:]
-
-                bs = batch_u0.shape[0]
-                total_val_samples += bs
-                batch_topo = topo.expand(bs, -1, -1)
-
-                # --- Model 1 Validation (Global Coarse) ---
-                U_pred = model(batch_forcing, batch_u0, batch_topo)
-                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
-                val_loss = criterion(U_pred, batch_u_out_lr)
-                total_valloss += val_loss.item() * bs
-
-                # --- Magnifier Validation (Local Refinement) ---
-                # Prepare padded buffers for the spatial sweep
-                u_pad = F.pad(U_pred.permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
+                batch_u_out_hr = batch_data[1][..., T_in:] 
                 
-                batch_topo = (batch_topo - GLOBAL_TOPO_MIN) / TOPO_RANGE
+                bs = batch_u0.shape[0]
+                total_samples += bs
+                batch_topo_train = topo.expand(bs, -1, -1)
 
-                topo_pad = F.pad(batch_topo, (N*f, N*f, N*f, N*f), mode='replicate')
+                # --- GLOBAL PASS ---
+                optimizer.zero_grad(set_to_none=True)
+                U_pred = model(batch_forcing, batch_u0, batch_topo_train)
+                U_pred[U_pred < DRY_THRESHOLD] = 0
+                
+                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
+                data_loss = criterion(U_pred, batch_u_out_lr)
+                
+                # STAGE 1: Standard FNO training
+                if training_mode == 'Stage1':
+                    data_loss.backward()
+                    optimizer.step()
+                    total_fnoloss += data_loss.item() * bs
+                    continue
+
+                # --- MAGNIFIER PASS (Stage 2 & Stage 3) ---
+                # IMPORTANT: Stage 3 keeps the graph alive; Stage 2 detaches to save memory
+                u_refined_input = U_pred if training_mode == 'Stage3' else U_pred.detach()
+                u_pad = F.pad(u_refined_input.permute(0, 3, 1, 2), (N, N, N, N), mode='replicate').permute(0, 2, 3, 1)
+                
+                batch_topo_norm = (batch_topo_train - GLOBAL_TOPO_MIN) / TOPO_RANGE
+                topo_pad = F.pad(batch_topo_norm, (N*f, N*f, N*f, N*f), mode='replicate')
                 target_pad = F.pad(batch_u_out_hr.permute(0, 3, 1, 2), (N*f, N*f, N*f, N*f), mode='replicate').permute(0, 2, 3, 1)
+                
+                all_batches = list(index_provider.get_batches())
+                random.shuffle(all_batches) 
 
-                for spatial_batch in val_batches:
-                    batch_patches_in = []
-                    batch_patches_trgt = []
+                batch_accumulated_mag_loss = 0.0
+                wet_batches_in_step = 0
+                wet_batches_processed = 0
+                accumulation_steps = 3 
 
+                # Patch Processing
+                for spatial_batch in all_batches:
+                    if wet_batches_processed >= WET_BATCH_QUOTA:
+                        break
+
+                    batch_patches_in, batch_patches_trgt = [], []
                     for (i_s, j_s) in spatial_batch:
-                        # Slice Target first to verify wetness
                         p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
-                        
-                        # Apply same physics-based filter used in training
-                        if p_target.max() < DRY_THRESHOLD:
-                            continue
+                        if p_target.max() < 0.025: continue 
 
-                        # Extract input for wet regions only
                         p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank)
                         batch_patches_in.append(p_in)
                         batch_patches_trgt.append(p_target)
 
-                    if batch_patches_in:
-                        big_in = torch.cat(batch_patches_in, dim=0)
-                        big_trgt = torch.cat(batch_patches_trgt, dim=0)
+                    if not batch_patches_in: continue
 
-                        # Predict refined water depth
-                        big_out = magnifier(big_in)
-                        mag_val_loss = criterion(big_out, big_trgt)
-                        
-                        num_wet = len(batch_patches_in)
-                        total_val_magloss += mag_val_loss.item() * (bs * num_wet)
-                        total_val_wet_patches += (bs * num_wet)
+                    big_out = magnifier(torch.cat(batch_patches_in, dim=0))
+                    mag_loss_patch = criterion(big_out, torch.cat(batch_patches_trgt, dim=0))
+                    
+                    # STAGE 2: Individual patch backward (Global is detached)
+                    if training_mode == 'Stage2':
+                        (mag_loss_patch / accumulation_steps).backward()
+                        if (wet_batches_processed + 1) % accumulation_steps == 0:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                    
+                    # STAGE 3: Aggregate loss for single backward (prevents graph error)
+                    else:
+                        batch_accumulated_mag_loss += mag_loss_patch
 
-        # --- Metrics Normalization ---
-        epoch_valloss = total_valloss / total_val_samples
-        
-        # Avoid division by zero if an entire validation set is dry
-        epoch_val_magloss = total_val_magloss / total_val_wet_patches if total_val_wet_patches > 0 else 0.0
-        
-        val_losses.append(epoch_valloss)
-        val_maglosses.append(epoch_val_magloss)
+                    wet_batches_processed += 1
+                    wet_batches_in_step += 1
+                    num_patches_total = bs * len(batch_patches_in)
+                    total_magloss += mag_loss_patch.item() * num_patches_total
+                    epoch_total_wet_patches += num_patches_total
 
-        # ---------------------------------------------------------
-        # 4. LOGGING AND CHECKPOINTING
-        # ---------------------------------------------------------
-        losses_dict_main = {
-            'Train FNO Loss': train_losses,
-            'Val FNO Loss': val_losses
-        }
-        if enable_ig_loss:
-            losses_dict_main['Train IG loss'] = train_iglosses
+                # Final Step for Stage 3 Joint Training
+                if training_mode == 'Stage3' and wet_batches_in_step > 0:
+                    (batch_accumulated_mag_loss / wet_batches_in_step).backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
-        losses_dict_magnifier = {
-            'Train Mag Loss': train_maglosses,
-            'Val Mag Loss': val_maglosses
-        }
+                total_fnoloss += data_loss.item() * bs
 
-        # Convert to DataFrames for persistence
-        df_main = pd.DataFrame(losses_dict_main)
-        df_magnifier = pd.DataFrame(losses_dict_magnifier)
+            # --- 3. EVALUATION PHASE ---
+            model.eval()
+            magnifier.eval()
+            total_valloss, total_val_magloss = 0.0, 0.0
+            total_val_samples, total_val_wet_patches = 0, 0
 
-        # Save Checkpoint (Only on rank 0 for DDP)
-        if save_results and (ep % 5 == 0) and (rank == 0):
-            checkpoint_data = {
-                'config': {
-                    # Model 1 Architecture
-                    'operator_type': operator_type,
-                    'Nx': nx, 'Ny': ny,
-                    'T_in': T_in, 'T_out': T_out,
-                    'Mode1_G':mode1, 'Mode2_G': mode2, 'Mode3_G': mode3, 'width_FNO': width_FNO,
+            # Sample 20% of spatial domain for validation speed
+            val_index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=8, subset_fraction=0.2)
+            val_batches = list(val_index_provider.get_batches())
 
-                    # Magnifier / Refinement Metadata
-                    'mx_coarse': mx, 'my_coarse': my,
-                    'N_window': N,           # Coarse patch size (5x5)
-                    'f_upscale': f,          # Upscale factor (10x)
-                    'Pf_fine': N * f,        # High-res output size (50x50)
-                    'dry_threshold': DRY_THRESHOLD,
-                    'accumulation_steps': accumulation_steps
-                },
-                'epoch': ep,
-                'model_state_dict': model.state_dict(),
-                'magnifier_state_dict': magnifier.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss_df_main': df_main,
-                'loss_df_magnifier': df_magnifier,
-            }
-            torch.save(checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}.pth")
-            print(f"\n[Checkpoint] Saved Epoch {ep+1} on Rank 0")
+            with torch.no_grad():
+                for batch_data in eval_loader:
+                    batch_data = [item.to(rank) for item in batch_data]
+                    v_forcing, v_sol = batch_data[0], batch_data[1]
+                    v_u0, v_hr = v_sol[..., :T_in], v_sol[..., T_in:]
 
-        # Step Scheduler
-        scheduler.step()
+                    bs_v = v_u0.shape[0]
+                    total_val_samples += bs_v
+                    v_topo = topo.expand(bs_v, -1, -1)
 
-        # Update Progress Bar with current Metrics
-        if rank == 0:
-            outer_loop.set_description(f"Epoch {ep + 1}/{epochs}")
-            outer_loop.set_postfix(
-                fno_v=f'{epoch_valloss:.2e}',
-                mag_v=f'{epoch_val_magloss:.2e}',
-                mag_t=f'{epoch_magloss:.2e}' # Training loss from previous section
-            )
+                    # Global Validation
+                    v_coarse_pred = model(v_forcing, v_u0, v_topo)
+                    total_valloss += criterion(v_coarse_pred, coarsen_spatial_tensor(v_hr, N=f)).item() * bs_v
 
+                    if training_mode == 'Stage1': continue
 
+                    # Magnifier Validation
+                    v_u_pad = F.pad(v_coarse_pred.permute(0, 3, 1, 2), (N,N,N,N), mode='replicate').permute(0,2,3,1)
+                    v_topo_pad = F.pad((v_topo - GLOBAL_TOPO_MIN)/TOPO_RANGE, (N*f,N*f,N*f,N*f), mode='replicate')
+                    v_trgt_pad = F.pad(v_hr.permute(0,3,1,2), (N*f,N*f,N*f,N*f), mode='replicate').permute(0,2,3,1)
+
+                    for spatial_batch in val_batches:
+                        v_p_in, v_p_trgt = [], []
+                        for (i_s, j_s) in spatial_batch:
+                            p_t = v_trgt_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
+                            if p_t.max() < DRY_THRESHOLD: continue
+                            v_p_in.append(prepare_patch_input(v_u_pad, v_topo_pad, i_s, j_s, N, f, rank))
+                            v_p_trgt.append(p_t)
+
+                        if v_p_in:
+                            v_out = magnifier(torch.cat(v_p_in, dim=0))
+                            num_w_total = bs_v * len(v_p_in)
+                            total_val_magloss += criterion(v_out, torch.cat(v_p_trgt, dim=0)).item() * num_w_total
+                            total_val_wet_patches += num_w_total
+
+            # --- 4. EPOCH LOGGING & NORMALIZATION ---
+            epoch_fnoloss = total_fnoloss / total_samples
+            epoch_valloss = total_valloss / total_val_samples
+            
+            # Ensure lists are updated even in Stage 1 to prevent length mismatch errors
+            epoch_magloss = total_magloss / max(epoch_total_wet_patches, 1) if training_mode != 'Stage1' else 0.0
+            epoch_val_magloss = total_val_magloss / max(total_val_wet_patches, 1) if training_mode != 'Stage1' else 0.0
+            
+            train_losses.append(epoch_fnoloss)
+            train_maglosses.append(epoch_magloss)
+            val_losses.append(epoch_valloss)
+            val_maglosses.append(epoch_val_magloss)
+
+            # Logging and Checkpointing
+            if rank == 0:
+                df_main = pd.DataFrame({'Train FNO Loss': train_losses, 'Val FNO Loss': val_losses})
+                df_magnifier = pd.DataFrame({'Train Mag Loss': train_maglosses, 'Val Mag Loss': val_maglosses})
+
+                if save_results and (ep % 5 == 0):
+                    checkpoint_data = {
+                        'config': {
+                            'Nx': nx, 'Ny': ny, 'T_in': T_in, 'T_out': T_out,
+                            'N_window': N, 'f_upscale': f, 'dry_threshold': DRY_THRESHOLD,
+                            'Mode1_G':mode1, 'Mode2_G': mode2, 'Mode3_G': mode3, 'width_FNO': width_FNO,
+                            'training_stage': training_mode
+                        },
+                        'epoch': ep,
+                        'model_state_dict': model.state_dict(),
+                        'magnifier_state_dict': magnifier.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss_df_main': df_main,
+                        'loss_df_magnifier': df_magnifier,
+                    }
+                    torch.save(checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}.pth")
+                    print(f"\n[Checkpoint] Saved Epoch {ep+1} for {training_mode}")
+
+                outer_loop.set_description(f"Epoch {ep + 1}/{epochs} [{training_mode}]")
+                outer_loop.set_postfix(fno_v=f'{epoch_valloss:.2e}', mag_v=f'{epoch_val_magloss:.2e}')
+
+            scheduler.step()
+    
     cleanup()
 
 
@@ -417,6 +372,7 @@ def main(
     ensure_directory(PATH_saved_models)
 
     if global_checkpoint_path != None:
+        print('Loading pre-trained global model ...')
         checkpoint = torch.load(global_checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract configuration from checkpoint
@@ -440,6 +396,7 @@ def main(
         model_fn.load_state_dict(state_dict)
 
     else:
+        print('Creating a raw global model ...')
         # Initialize with default/global variables if no checkpoint is used
         model_fn = FNO3d(
             T_in=T_in, T_out=T_out,
@@ -456,6 +413,7 @@ def main(
 
 
     if mag_checkpoint_path != None:
+        print('Loading pre-trained magnifier model ...')
         # Path to your specific magnifier checkpoint
         mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
         checkpoint_mag = torch.load(mag_checkpoint_path, map_location='cpu', weights_only=False)
@@ -473,6 +431,7 @@ def main(
         magnifier_fn.load_state_dict(state_dict_mag)
 
     else:
+        print('Creating a raw magnifier model ...')
         # Fresh initialization for the magnifier
         magnifier_fn = magnifier(width=32)
 
@@ -506,11 +465,6 @@ def main(
         nprocs=world_size,
         join=True
     )
-    # model_fn = create_model(operator_type, T_in, T_out, nx, ny, 
-    #                 width_CNO=width_CNO, depth_CNO=depth_CNO, kernel_size=kernel_size, unet_depth=unet_depth,  # CNO inputs
-    #                 mode1=mode1, mode2=mode2, mode3=mode3, width_FNO=width_FNO,  # FNO inputs
-    #                 wavelet=wavelet, level=level, layers=layers, grid_range=grid_range, width_WNO=width_WNO,  # WNO inputs
-    #                 branch_layers=branch_layers, trunk_layers=trunk_layers)
 
 # %%
 if __name__ == "__main__":
@@ -532,22 +486,25 @@ if __name__ == "__main__":
 
     save_results = True
     # Dataset sizes
-    train_size = 100
+    train_size = 300
     eval_size = 150
 
     # train_size = 5
     # eval_size = 5
 
     # NOTE: If this path be None, code creat new raw models 
-    mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
-    checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
-
+    # mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
+    # global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+    
+    mag_checkpoint_path = None
+    global_checkpoint_path = None
+    
+    
     # --- Training Configuration ---
     # Stage 1: Pre-train Global Model (FNO) only
     # Stage 2: Freeze Global Model, Pre-train Magnifier only
     # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
     training_mode = 'Stage3'
-
 
     tmp_ds = LargeHydrologyDataset(a_path, u_path)
     # 2. Split with a fixed generator for reproducibility
@@ -560,7 +517,7 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    tag = 'test_mag_fine_tuned'  # Number of random samples along x, y axes for Jacobian calculations
+    tag = 'test_mag_end_to_end' # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
     batch_size = 4
@@ -591,6 +548,7 @@ if __name__ == "__main__":
     mode_x = 6
     mode_y = 6
     mode_t = 6
+
     width_FNO = 20
 
     # WNO inputs
@@ -608,7 +566,7 @@ if __name__ == "__main__":
     # Call the main function with organized inputs
     main(
         enable_ig_loss, save_results, 
-        global_checkpoint_path,
+        global_checkpoint_path, 
         mag_checkpoint_path,
         training_mode,
         topo_path, a_path, u_path, train_idx, eval_idx, case, 
