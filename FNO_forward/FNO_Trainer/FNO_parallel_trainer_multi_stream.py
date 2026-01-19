@@ -176,7 +176,7 @@ def train_model(rank, world_size,
                 # STAGE 1: Standard FNO training
                 if training_mode == 'Stage1':
                     data_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     optimizer.step()
                     total_fnoloss += data_loss.item() * bs
                     continue
@@ -244,7 +244,7 @@ def train_model(rank, world_size,
                         (mag_loss_patch / accumulation_steps).backward()
                         if (wet_batches_processed + 1) % accumulation_steps == 0:
                             optimizer.step()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                             optimizer.zero_grad(set_to_none=True)
                     
                     # STAGE 3: Aggregate loss for single backward
@@ -260,8 +260,8 @@ def train_model(rank, world_size,
                 # Final Step for Stage 3 Joint Training
                 if training_mode == 'Stage3' and wet_batches_in_step > 0:
                     (batch_accumulated_mag_loss / wet_batches_in_step).backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 0.5)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
