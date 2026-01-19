@@ -28,7 +28,7 @@ from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 from models.fno3d_encoder import FNO3d
 # from models.magnifier import MagnifierModel as magnifier
 # from models.magnifier1 import Deep3DMagnifier as magnifier
-from models.magnifier5 import CrossAttentionMagnifier as magnifier
+from models.magnifier4 import FiLMLightMagnifier as magnifier
 
 from lib.helper import LargeHydrologyDataset, PaddedIndexProvider, prepare_patch_input, BathtubReconstructor   
 from lib.ddp_helpers import setup, cleanup
@@ -86,7 +86,7 @@ def train_model(rank, world_size,
                          "Must be 'Stage1', 'Stage2', or 'Stage3'.")
 
     # ---- Optimizer & Scheduler ----
-    optimizer = optim.Adam(param_groups)
+    optimizer = optim.AdamW(param_groups)
     scheduler = StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 
 
@@ -480,7 +480,7 @@ def main(
     else:
         print('Creating a raw magnifier model ...')
         # Fresh initialization for the magnifier
-        magnifier_fn = magnifier(width=32)
+        magnifier_fn = magnifier(width=64)
 
     magnifier_fn = magnifier_fn.to(device)
 
@@ -565,10 +565,10 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    tag = 'test_mag_residual' # Number of random samples along x, y axes for Jacobian calculations
+    tag = 'test_mag_residual2' # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
-    batch_size = 2
+    batch_size = 4
     epochs = 500
     learning_rate = 0.001
     scheduler_step = 50
