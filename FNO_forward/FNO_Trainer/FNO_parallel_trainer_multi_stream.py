@@ -348,6 +348,7 @@ def train_model(rank, world_size,
 
                 if save_results and (ep % 5 == 0):
                     checkpoint_data = {
+                        'training_mode': training_mode,
                         'config': {
                             'Nx': nx, 'Ny': ny, 'T_in': T_in, 'T_out': T_out,
                             'N_window': N, 'f_upscale': f, 'dry_threshold': DRY_THRESHOLD,
@@ -567,7 +568,7 @@ if __name__ == "__main__":
     tag = 'test_mag_residual' # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
-    batch_size = 4
+    batch_size = 2
     epochs = 500
     learning_rate = 0.001
     scheduler_step = 50
