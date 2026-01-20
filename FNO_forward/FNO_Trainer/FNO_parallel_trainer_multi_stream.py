@@ -540,10 +540,10 @@ if __name__ == "__main__":
     # eval_size = 5
 
     # NOTE: If this path be None, code creat new raw models 
-    # mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual2_FNO_DDP_300.pth'
+    mag_checkpoint_path =    'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
     global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
     
-    mag_checkpoint_path = None
+    # mag_checkpoint_path = None
     # global_checkpoint_path = None
     
     
@@ -564,7 +564,7 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    tag = 'test_mag_residual_model5' # Number of random samples along x, y axes for Jacobian calculations
+    tag = 'test_mag_residual_model5_C' # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
     batch_size = 4
