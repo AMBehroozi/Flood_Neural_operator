@@ -28,7 +28,7 @@ from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 from models.fno3d_encoder import FNO3d
 # from models.magnifier import MagnifierModel as magnifier
 # from models.magnifier1 import Deep3DMagnifier as magnifier
-from models.magnifier4 import FiLMLightMagnifier as magnifier
+from models.magnifier5 import FiLMLightMagnifier as magnifier
 
 from lib.helper import LargeHydrologyDataset, PaddedIndexProvider, prepare_patch_input, BathtubReconstructor   
 from lib.ddp_helpers import setup, cleanup
@@ -244,7 +244,7 @@ def train_model(rank, world_size,
                         (mag_loss_patch / accumulation_steps).backward()
                         if (wet_batches_processed + 1) % accumulation_steps == 0:
                             optimizer.step()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                             optimizer.zero_grad(set_to_none=True)
                     
                     # STAGE 3: Aggregate loss for single backward
@@ -260,8 +260,8 @@ def train_model(rank, world_size,
                 # Final Step for Stage 3 Joint Training
                 if training_mode == 'Stage3' and wet_batches_in_step > 0:
                     (batch_accumulated_mag_loss / wet_batches_in_step).backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 0.1)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -462,7 +462,6 @@ def main(
     if mag_checkpoint_path != None:
         print('Loading pre-trained magnifier model ...')
         # Path to your specific magnifier checkpoint
-        mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
         checkpoint_mag = torch.load(mag_checkpoint_path, map_location='cpu', weights_only=False)
         
         # Initialize magnifier architecture
@@ -541,7 +540,7 @@ if __name__ == "__main__":
     # eval_size = 5
 
     # NOTE: If this path be None, code creat new raw models 
-    # mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag3_FNO_DDP_100.pth'
+    # mag_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual2_FNO_DDP_300.pth'
     global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
     
     mag_checkpoint_path = None
@@ -565,7 +564,7 @@ if __name__ == "__main__":
     eval_idx  = perm[train_size:train_size + eval_size]
 
     # Sampling configuration
-    tag = 'test_mag_residual2' # Number of random samples along x, y axes for Jacobian calculations
+    tag = 'test_mag_residual_model5' # Number of random samples along x, y axes for Jacobian calculations
 
     # Training hyperparameters
     batch_size = 4
