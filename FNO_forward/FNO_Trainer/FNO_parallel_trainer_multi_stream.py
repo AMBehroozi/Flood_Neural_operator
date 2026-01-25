@@ -519,91 +519,10 @@ def main(
     )
 
 # %%
-# if __name__ == "__main__":
-#     # System and environment setup
-#     run_nvidia_smi()  # Check GPU status
-#     MHPI()           # Initialize MHPI (if this is a custom function)
-#     import warnings
-#     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
-
-#     # Dataset and case configuration
-#     MAIN_PATH = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/scenario_groups_1/'
-#     # This creates a 'pointer' to the data on disk without filling up your RAM
-#     topo_path = MAIN_PATH + 'hurricane_matthew_processed_data_bed_2.pt'
-#     a_path = MAIN_PATH + "hurricane_matthew_processed_data_input_2.pt"
-#     u_path = MAIN_PATH + "hurricane_matthew_processed_data_solution_2.pt"
-
-#     case = 'Hurricane_Matthew'
-#     enable_ig_loss = False  # Enable/disable IG loss
-
-#     save_results = True
-#     # Dataset sizes
-#     train_size = 300
-#     eval_size = 150
-
-#     # train_size = 5
-#     # eval_size = 5
-
-#     # NOTE: If this path be None, code creat new raw models 
-#     mag_checkpoint_path =    'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
-#     global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
-    
-#     # mag_checkpoint_path = None
-#     # global_checkpoint_path = None
-    
-    
-#     # --- Training Configuration ---
-#     # Stage 1: Pre-train Global Model (FNO) only
-#     # Stage 2: Freeze Global Model, Pre-train Magnifier only
-#     # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
-#     training_mode = 'Stage2'
-
-#     tmp_ds = LargeHydrologyDataset(a_path, u_path)
-#     # 2. Split with a fixed generator for reproducibility
-#     n = len(tmp_ds)
-
-#     # Make deterministic indices
-#     g = torch.Generator().manual_seed(42)
-#     perm = torch.randperm(n, generator=g).tolist()
-#     train_idx = perm[:train_size]
-#     eval_idx  = perm[train_size:train_size + eval_size]
-
-#     # Sampling configuration
-#     tag = 'test_mag_residual_model5_C' # Number of random samples along x, y axes for Jacobian calculations
-
-#     # Training hyperparameters
-#     batch_size = 4
-#     epochs = 500
-#     learning_rate = 0.001
-#     scheduler_step = 50
-#     scheduler_gamma = 0.95
-
-#     # Model configuration
-#     operator_type = 'FNO'  # Options: 'CNO', 'FNO', 'WNO', 'DeepONet'
-
-#     # Temporal and spatial dimensions
-#     total_steps = 89
-#     T_in = 1
-#     T_out = total_steps - T_in
-
-#     nx = 328
-#     ny = 164
-
-#     magnification_factor = 4
-
-
-#     # Model-specific inputs
-#     # FNO inputs
-#     mode_x = 6
-#     mode_y = 6
-#     mode_t = 6
-
-#     width_FNO = 20
-
 
 if __name__ == "__main__":
     # 1. Initialization & Config Loading
-    cfg = load_config('FNO_forward/FNO_Trainer/train_flooding_config.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config.yml')
     run_nvidia_smi()
     MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
@@ -717,3 +636,84 @@ if __name__ == "__main__":
     )
 
 #%%
+
+# if __name__ == "__main__":
+#     # System and environment setup
+#     run_nvidia_smi()  # Check GPU status
+#     MHPI()           # Initialize MHPI (if this is a custom function)
+#     import warnings
+#     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
+
+#     # Dataset and case configuration
+#     MAIN_PATH = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/scenario_groups_1/'
+#     # This creates a 'pointer' to the data on disk without filling up your RAM
+#     topo_path = MAIN_PATH + 'hurricane_matthew_processed_data_bed_2.pt'
+#     a_path = MAIN_PATH + "hurricane_matthew_processed_data_input_2.pt"
+#     u_path = MAIN_PATH + "hurricane_matthew_processed_data_solution_2.pt"
+
+#     case = 'Hurricane_Matthew'
+#     enable_ig_loss = False  # Enable/disable IG loss
+
+#     save_results = True
+#     # Dataset sizes
+#     train_size = 300
+#     eval_size = 150
+
+#     # train_size = 5
+#     # eval_size = 5
+
+#     # NOTE: If this path be None, code creat new raw models 
+#     mag_checkpoint_path =    'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
+#     global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+    
+#     # mag_checkpoint_path = None
+#     # global_checkpoint_path = None
+    
+    
+#     # --- Training Configuration ---
+#     # Stage 1: Pre-train Global Model (FNO) only
+#     # Stage 2: Freeze Global Model, Pre-train Magnifier only
+#     # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
+#     training_mode = 'Stage2'
+
+#     tmp_ds = LargeHydrologyDataset(a_path, u_path)
+#     # 2. Split with a fixed generator for reproducibility
+#     n = len(tmp_ds)
+
+#     # Make deterministic indices
+#     g = torch.Generator().manual_seed(42)
+#     perm = torch.randperm(n, generator=g).tolist()
+#     train_idx = perm[:train_size]
+#     eval_idx  = perm[train_size:train_size + eval_size]
+
+#     # Sampling configuration
+#     tag = 'test_mag_residual_model5_C' # Number of random samples along x, y axes for Jacobian calculations
+
+#     # Training hyperparameters
+#     batch_size = 4
+#     epochs = 500
+#     learning_rate = 0.001
+#     scheduler_step = 50
+#     scheduler_gamma = 0.95
+
+#     # Model configuration
+#     operator_type = 'FNO'  # Options: 'CNO', 'FNO', 'WNO', 'DeepONet'
+
+#     # Temporal and spatial dimensions
+#     total_steps = 89
+#     T_in = 1
+#     T_out = total_steps - T_in
+
+#     nx = 328
+#     ny = 164
+
+#     magnification_factor = 4
+
+
+#     # Model-specific inputs
+#     # FNO inputs
+#     mode_x = 6
+#     mode_y = 6
+#     mode_t = 6
+
+#     width_FNO = 20

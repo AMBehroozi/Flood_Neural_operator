@@ -14,8 +14,8 @@ experiment:
   training_mode: 'Stage2' # Options: Stage1, Stage2, Stage3
   enable_ig_loss: false
   save_results: false
-  train_size: 300
-  eval_size: 150
+  train_size: 5
+  eval_size: 5
   seed: 42
 
 # Global Hyperparameters
