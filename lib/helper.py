@@ -277,19 +277,79 @@ def coarsen_spatial_tensor(tensor, N, mode='avg'):
 
 
     
+# class LargeHydrologyDataset(Dataset):
+#     def __init__(self, file_a, file_u, m_map=True):
+#         # mmap=True keeps data on disk; only indices are loaded initially
+#         self.m_map = m_map
+#         self.a = torch.load(file_a, mmap=self.m_map, map_location='cpu')
+#         self.u = torch.load(file_u, mmap=self.m_map, map_location='cpu')
+
+#     def __len__(self):
+#         return self.a.shape[0]
+
+#     def __getitem__(self, idx):
+#         # Data is read from disk into RAM only when indexed
+#         return self.a[idx], self.u[idx]
+
+
+
+import torch
+import pandas as pd
+import numpy as np
+from torch.utils.data import Dataset
+from matplotlib.path import Path
+
 class LargeHydrologyDataset(Dataset):
-    def __init__(self, file_a, file_u, m_map=True):
-        # mmap=True keeps data on disk; only indices are loaded initially
+    def __init__(self, file_a, file_u, m_map=True, mask=False, csv_path=None, Lx=None, Ly=None):
         self.m_map = m_map
         self.a = torch.load(file_a, mmap=self.m_map, map_location='cpu')
         self.u = torch.load(file_u, mmap=self.m_map, map_location='cpu')
+        
+        self.do_masking = mask
+        self.spatial_mask = None
+
+        if self.do_masking:
+            if csv_path is None or Lx is None or Ly is None:
+                raise ValueError("Masking requires csv_path, Lx, and Ly to be defined.")
+            
+            # Pre-compute the mask during initialization
+            self.spatial_mask = self._generate_static_mask(csv_path, Lx, Ly)
+
+    def _generate_static_mask(self, csv_path, Lx, Ly):
+        """Creates a [nx, ny, 1] mask based on boundary points."""
+        # Load nx, ny from the loaded data
+        _, nx, ny, _ = self.a.shape
+        
+        # Load raw CSV (no headers)
+        df = pd.read_csv(csv_path, header=None)
+        points = df[[0, 1]].values 
+        
+        # Create coordinate grid
+        x_coords = np.linspace(0, Lx, nx)
+        y_coords = np.linspace(0, Ly, ny)
+        xv, yv = np.meshgrid(x_coords, y_coords, indexing='ij')
+        grid_points = np.vstack((xv.flatten(), yv.flatten())).T
+        
+        # Point-in-polygon logic
+        poly_path = Path(points)
+        mask_flat = poly_path.contains_points(grid_points)
+        
+        # Convert to tensor and reshape for broadcasting [nx, ny, 1]
+        mask_2d = torch.from_numpy(mask_flat.reshape(nx, ny))
+        final_mask = torch.logical_not(mask_2d).float()
+        return final_mask.unsqueeze(-1) # Shape: [nx, ny, 1]
 
     def __len__(self):
         return self.a.shape[0]
 
     def __getitem__(self, idx):
-        # Data is read from disk into RAM only when indexed
-        return self.a[idx], self.u[idx]
+        # Fetch data (mmap keeps this efficient)
+        sample_a = self.a[idx]
+        sample_u = self.u[idx]
 
+        # Apply mask if requested
+        if self.do_masking and self.spatial_mask is not None:
+            sample_a = sample_a * self.spatial_mask
+            sample_u = sample_u * self.spatial_mask
 
-
+        return sample_a, sample_u

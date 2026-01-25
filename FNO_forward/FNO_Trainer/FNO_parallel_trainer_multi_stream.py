@@ -1,6 +1,8 @@
 import os
 import sys
 import warnings
+import yaml
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -36,6 +38,10 @@ from lib.helper import coarsen_spatial_tensor
 from lib.util import run_nvidia_smi, MHPI
 
 
+def load_config(config_path):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
 def train_model(rank, world_size, 
                 training_mode,
                 model_fn, magnifier_fn, awl_fn, learning_rate,
@@ -48,7 +54,7 @@ def train_model(rank, world_size,
                 branch_layers, trunk_layers,                    # DeepONet inputs
 
                 epochs, PATH_saved_models, Mode, tag, 
-                enable_ig_loss, L_x, L_y, criterion,
+                enable_ig_loss, mask, csv_path, L_x, L_y, criterion,
                 save_results, 
                 case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx):
     
@@ -96,7 +102,7 @@ def train_model(rank, world_size,
     GLOBAL_TOPO_MAX = topo.max()
     TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
     # ---- Dataset / loaders ----
-    full_dataset = LargeHydrologyDataset(a_path, u_path)
+    full_dataset = LargeHydrologyDataset(a_path, u_path, mask=False, csv_path=None, Lx=None, Ly=None)
     train_dataset = Subset(full_dataset, train_idx)
     eval_dataset  = Subset(full_dataset, eval_idx)
 
@@ -387,6 +393,7 @@ def main(
     scheduler_step, scheduler_gamma,
     operator_type, T_in, T_out, nx, ny,
     magnification_factor,
+    mask=None, csv_path=None, L_x=None, L_y=None,
     width_CNO=None, depth_CNO=None, kernel_size=None, unet_depth=None,
     mode1=None, mode2=None, mode3=None, width_FNO=None,
     wavelet=None, level=None, layers=None, grid_range=None, width_WNO=None,
@@ -400,8 +407,6 @@ def main(
     device = torch.device("cuda")
     print(f"Using device: {device}")
 
-
-    L_x, L_y = 1.0, 1.0
 
     # Build experiment name (train_size inferred from indices)
     train_size = len(train_idx)
@@ -505,7 +510,7 @@ def main(
             branch_layers, trunk_layers,
 
             epochs, PATH_saved_models, Mode, tag,
-            enable_ig_loss, L_x, L_y, criterion,
+            enable_ig_loss, mask, csv_path, L_x, L_y, criterion,
             save_results,
             case, batch_size, topo_path, a_path, u_path, train_idx, eval_idx
         ),
@@ -514,89 +519,157 @@ def main(
     )
 
 # %%
+# if __name__ == "__main__":
+#     # System and environment setup
+#     run_nvidia_smi()  # Check GPU status
+#     MHPI()           # Initialize MHPI (if this is a custom function)
+#     import warnings
+#     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
+
+#     # Dataset and case configuration
+#     MAIN_PATH = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/scenario_groups_1/'
+#     # This creates a 'pointer' to the data on disk without filling up your RAM
+#     topo_path = MAIN_PATH + 'hurricane_matthew_processed_data_bed_2.pt'
+#     a_path = MAIN_PATH + "hurricane_matthew_processed_data_input_2.pt"
+#     u_path = MAIN_PATH + "hurricane_matthew_processed_data_solution_2.pt"
+
+#     case = 'Hurricane_Matthew'
+#     enable_ig_loss = False  # Enable/disable IG loss
+
+#     save_results = True
+#     # Dataset sizes
+#     train_size = 300
+#     eval_size = 150
+
+#     # train_size = 5
+#     # eval_size = 5
+
+#     # NOTE: If this path be None, code creat new raw models 
+#     mag_checkpoint_path =    'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
+#     global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+    
+#     # mag_checkpoint_path = None
+#     # global_checkpoint_path = None
+    
+    
+#     # --- Training Configuration ---
+#     # Stage 1: Pre-train Global Model (FNO) only
+#     # Stage 2: Freeze Global Model, Pre-train Magnifier only
+#     # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
+#     training_mode = 'Stage2'
+
+#     tmp_ds = LargeHydrologyDataset(a_path, u_path)
+#     # 2. Split with a fixed generator for reproducibility
+#     n = len(tmp_ds)
+
+#     # Make deterministic indices
+#     g = torch.Generator().manual_seed(42)
+#     perm = torch.randperm(n, generator=g).tolist()
+#     train_idx = perm[:train_size]
+#     eval_idx  = perm[train_size:train_size + eval_size]
+
+#     # Sampling configuration
+#     tag = 'test_mag_residual_model5_C' # Number of random samples along x, y axes for Jacobian calculations
+
+#     # Training hyperparameters
+#     batch_size = 4
+#     epochs = 500
+#     learning_rate = 0.001
+#     scheduler_step = 50
+#     scheduler_gamma = 0.95
+
+#     # Model configuration
+#     operator_type = 'FNO'  # Options: 'CNO', 'FNO', 'WNO', 'DeepONet'
+
+#     # Temporal and spatial dimensions
+#     total_steps = 89
+#     T_in = 1
+#     T_out = total_steps - T_in
+
+#     nx = 328
+#     ny = 164
+
+#     magnification_factor = 4
+
+
+#     # Model-specific inputs
+#     # FNO inputs
+#     mode_x = 6
+#     mode_y = 6
+#     mode_t = 6
+
+#     width_FNO = 20
+
+
 if __name__ == "__main__":
-    # System and environment setup
-    run_nvidia_smi()  # Check GPU status
-    MHPI()           # Initialize MHPI (if this is a custom function)
-    import warnings
+    # 1. Initialization & Config Loading
+    cfg = load_config('FNO_forward/FNO_Trainer/train_flooding_config.yml')
+    run_nvidia_smi()
+    MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
 
-    # Dataset and case configuration
-    MAIN_PATH = '/storage/group/cxs1024/default/mehdi/Hurricane_Matthew_scenario_groups/scenario_groups_1/'
-    # This creates a 'pointer' to the data on disk without filling up your RAM
-    topo_path = MAIN_PATH + 'hurricane_matthew_processed_data_bed_2.pt'
-    a_path = MAIN_PATH + "hurricane_matthew_processed_data_input_2.pt"
-    u_path = MAIN_PATH + "hurricane_matthew_processed_data_solution_2.pt"
-
-    case = 'Hurricane_Matthew'
-    enable_ig_loss = False  # Enable/disable IG loss
-
-    save_results = True
-    # Dataset sizes
-    train_size = 300
-    eval_size = 150
-
-    # train_size = 5
-    # eval_size = 5
-
-    # NOTE: If this path be None, code creat new raw models 
-    mag_checkpoint_path =    'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
-    global_checkpoint_path = 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+    # 2. Extract Paths & IO
+    paths = cfg['paths']
+    topo_path = os.path.join(paths['main_path'], paths['topo_file'])
+    a_path    = os.path.join(paths['main_path'], paths['input_file'])
+    u_path    = os.path.join(paths['main_path'], paths['solution_file'])
     
-    # mag_checkpoint_path = None
-    # global_checkpoint_path = None
-    
-    
-    # --- Training Configuration ---
-    # Stage 1: Pre-train Global Model (FNO) only
-    # Stage 2: Freeze Global Model, Pre-train Magnifier only
-    # Stage 3: End-to-End Fine-tuning of Global + Magnifier together
-    training_mode = 'Stage2'
+    mag_checkpoint_path    = paths.get('mag_checkpoint')
+    global_checkpoint_path = paths.get('global_checkpoint')
 
+    # 3. Experiment Logic
+    exp = cfg['experiment']
+    case, tag = exp['case'], exp['tag']
+    training_mode = exp['training_mode']
+    enable_ig_loss, save_results = exp['enable_ig_loss'], exp['save_results']
+
+    # 4. Dataset Initialization & Deterministic Splitting
     tmp_ds = LargeHydrologyDataset(a_path, u_path)
-    # 2. Split with a fixed generator for reproducibility
-    n = len(tmp_ds)
+    g = torch.Generator().manual_seed(exp['seed'])
+    perm = torch.randperm(len(tmp_ds), generator=g).tolist()
+    
+    train_idx = perm[:exp['train_size']]
+    eval_idx  = perm[exp['train_size'] : exp['train_size'] + exp['eval_size']]
 
-    # Make deterministic indices
-    g = torch.Generator().manual_seed(42)
-    perm = torch.randperm(n, generator=g).tolist()
-    train_idx = perm[:train_size]
-    eval_idx  = perm[train_size:train_size + eval_size]
+    # 5. Training Hyperparameters
+    train_cfg = cfg['training']
+    batch_size = train_cfg['batch_size']
+    epochs = train_cfg['epochs']
+    learning_rate = train_cfg['learning_rate']
+    scheduler_step = train_cfg['scheduler_step']
+    scheduler_gamma = train_cfg['scheduler_gamma']
 
-    # Sampling configuration
-    tag = 'test_mag_residual_model5_C' # Number of random samples along x, y axes for Jacobian calculations
 
-    # Training hyperparameters
-    batch_size = 4
-    epochs = 500
-    learning_rate = 0.001
-    scheduler_step = 50
-    scheduler_gamma = 0.95
+    data_mask_cfg = cfg['data_mask']
+    mask = data_mask_cfg['mask']
+    csv_path = data_mask_cfg['csv_path']
+    L_x = data_mask_cfg['L_x']
+    L_y = data_mask_cfg['L_y']
 
-    # Model configuration
-    operator_type = 'FNO'  # Options: 'CNO', 'FNO', 'WNO', 'DeepONet'
 
-    # Temporal and spatial dimensions
-    total_steps = 89
-    T_in = 1
-    T_out = total_steps - T_in
 
-    nx = 328
-    ny = 164
+    # 6. Model Parameters
+    m_cfg = cfg['model']
+    operator_type = m_cfg['operator_type']
+    nx, ny = m_cfg['nx'], m_cfg['ny']
+    T_in = m_cfg['t_in']
+    T_out = m_cfg['total_steps'] - T_in
+    magnification_factor = m_cfg['magnification_factor']
 
-    magnification_factor = 4
-    # Model-specific inputs
+    # 7. Model-Specific Logic (e.g., FNO)
+    fno_cfg =   cfg['fno']
+    mode_x =    cfg['fno']['mode_x']
+    mode_y =    cfg['fno']['mode_y']
+    mode_t =    cfg['fno']['mode_t']
+    width_FNO = cfg['fno']['width']
+
+    print(f"--- Config Loaded for {case} ({training_mode}) ---")
+    print(f"Training on {len(train_idx)} samples; Evaluating on {len(eval_idx)} samples.")
+
     # CNO inputs
     width_CNO, depth_CNO = 128, 4
     kernel_size = 3
     unet_depth = 4
-
-    # FNO inputs
-    mode_x = 6
-    mode_y = 6
-    mode_t = 6
-
-    width_FNO = 20
 
     # WNO inputs
     wavelet = 'db6'  # Wavelet basis function
@@ -620,7 +693,8 @@ if __name__ == "__main__":
         tag, batch_size, 
         epochs, learning_rate, scheduler_step, scheduler_gamma, 
         operator_type, T_in, T_out, nx=nx, ny=ny,
-        magnification_factor=magnification_factor, 
+        magnification_factor=magnification_factor,
+        mask=mask, csv_path=csv_path, L_x=L_x, L_y=L_y,
         # CNO inputs
         width_CNO=width_CNO if operator_type == 'CNO' else None,
         depth_CNO=depth_CNO if operator_type == 'CNO' else None,
