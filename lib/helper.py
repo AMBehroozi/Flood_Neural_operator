@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
 import torch.nn as nn
-
+import gc
 
 class BathtubReconstructor(nn.Module):
     def __init__(self, topo_patch, f, max_iters=20):
@@ -244,8 +244,9 @@ def coarsen_spatial_tensor(tensor, N, mode='avg'):
     Args:
         tensor: Input tensor [nb, nx, ny, nt]
         N: Downsampling factor
-        mode: 'avg' for Average Pooling (mass conservation/blocky)
-              'bilinear' for Bilinear Interpolation (smooth/continuous)
+        mode: 'avg' for Average Pooling
+              'bilinear' for Bilinear Interpolation
+              'area' for Area Interpolation (Best for Mass Conservation)
     """
     if N == 1:
         return tensor
@@ -263,20 +264,58 @@ def coarsen_spatial_tensor(tensor, N, mode='avg'):
     if mode == 'avg':
         # Average Pooling: Discrete blocks
         x_coarse = F.avg_pool2d(x, kernel_size=N, stride=N)
+    elif mode == 'area':
+        # Area: Resamples using pixel area relation (excellent for downsampling)
+        x_coarse = F.interpolate(x, size=(nx_new, ny_new), mode='area')
     elif mode == 'bilinear':
         # Bilinear: Smooth interpolation
-        # align_corners=False is usually preferred for downsampling
         x_coarse = F.interpolate(x, size=(nx_new, ny_new), mode='bilinear', align_corners=False)
     else:
-        raise ValueError("Mode must be 'avg' or 'bilinear'")
+        raise ValueError("Mode must be 'avg', 'area', or 'bilinear'")
     
     # 4. Reshape and Permute back to [nb, nx_new, ny_new, nt]
     result = x_coarse.view(nb, nt, nx_new, ny_new).permute(0, 2, 3, 1)
     
     return result
 
-
+# def coarsen_spatial_tensor(tensor, N, mode='avg'):
+#     """
+#     Coarsens a tensor of shape [nb, nx, ny, nt] by a factor of N.
     
+#     Args:
+#         tensor: Input tensor [nb, nx, ny, nt]
+#         N: Downsampling factor
+#         mode: 'avg' for Average Pooling (mass conservation/blocky)
+#               'bilinear' for Bilinear Interpolation (smooth/continuous)
+#     """
+#     if N == 1:
+#         return tensor
+        
+#     nb, nx, ny, nt = tensor.shape
+    
+#     # 1. Prepare for 2D spatial operations
+#     # Shape: [nb * nt, 1, nx, ny]
+#     x = tensor.permute(0, 3, 1, 2).reshape(nb * nt, 1, nx, ny)
+    
+#     # 2. Calculate new dimensions
+#     nx_new, ny_new = nx // N, ny // N
+
+#     # 3. Apply selected method
+#     if mode == 'avg':
+#         # Average Pooling: Discrete blocks
+#         x_coarse = F.avg_pool2d(x, kernel_size=N, stride=N)
+#     elif mode == 'bilinear':
+#         # Bilinear: Smooth interpolation
+#         # align_corners=False is usually preferred for downsampling
+#         x_coarse = F.interpolate(x, size=(nx_new, ny_new), mode='bilinear', align_corners=False)
+#     else:
+#         raise ValueError("Mode must be 'avg' or 'bilinear'")
+    
+#     # 4. Reshape and Permute back to [nb, nx_new, ny_new, nt]
+#     result = x_coarse.view(nb, nt, nx_new, ny_new).permute(0, 2, 3, 1)
+    
+#     return result
+
 # class LargeHydrologyDataset(Dataset):
 #     def __init__(self, file_a, file_u, m_map=True):
 #         # mmap=True keeps data on disk; only indices are loaded initially
@@ -349,7 +388,6 @@ class LargeHydrologyDataset(Dataset):
 
         # Apply mask if requested
         if self.do_masking and self.spatial_mask is not None:
-            sample_a = sample_a * self.spatial_mask
             sample_u = sample_u * self.spatial_mask
 
         return sample_a, sample_u

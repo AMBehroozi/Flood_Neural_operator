@@ -27,7 +27,7 @@ sys.path.append("./")
 from lib.utilities3 import ensure_directory, check_if_from_ddp, adjust_state_dict
 from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 
-from models.fno3d_encoder import FNO3d
+from models.fno3d_encoder2 import FNO3d
 # from models.magnifier import MagnifierModel as magnifier
 # from models.magnifier1 import Deep3DMagnifier as magnifier
 from models.magnifier5 import FiLMLightMagnifier as magnifier
@@ -75,6 +75,7 @@ def train_model(rank, world_size,
         
         print('Stage 1: Pre-train Global Model (FNO) only')
         param_groups.append({'params': model.parameters(), 'lr': learning_rate})
+        # param_groups.append({'params': model.parameters()})
         
     elif training_mode == 'Stage2': # Only Magnifier (Freeze Global)
         print('Stage 2: Freeze Global Model, Pre-train Magnifier only')
@@ -102,7 +103,7 @@ def train_model(rank, world_size,
     GLOBAL_TOPO_MAX = topo.max()
     TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
     # ---- Dataset / loaders ----
-    full_dataset = LargeHydrologyDataset(a_path, u_path, mask=False, csv_path=None, Lx=None, Ly=None)
+    full_dataset = LargeHydrologyDataset(a_path, u_path, mask=mask, csv_path=csv_path, Lx=L_x, Ly=L_y)
     train_dataset = Subset(full_dataset, train_idx)
     eval_dataset  = Subset(full_dataset, eval_idx)
 
@@ -163,26 +164,27 @@ def train_model(rank, world_size,
             # --- 2. TRAINING BATCH LOOP ---
             for batch_data in train_loader:
                 batch_data = [item.to(rank) for item in batch_data]
-                batch_forcing  = batch_data[0]
-                batch_u0       = batch_data[1][..., :T_in]
-                batch_u_out_hr = batch_data[1][..., T_in:] 
+                batch_forcing  = batch_data[0][..., ::2]
+                batch_u0       = torch.ones_like(batch_data[1][..., ::2][..., :T_in])
+                
+                batch_u_out_hr = batch_data[1][..., ::2][..., T_in:] 
                 
                 bs = batch_u0.shape[0]
                 total_samples += bs
                 batch_topo_train = topo.expand(bs, -1, -1)
-
+                # batch_topo_norm = (batch_topo_train - GLOBAL_TOPO_MIN) / TOPO_RANGE
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
                 U_pred = model(batch_forcing, batch_u0, batch_topo_train)
-                U_pred[U_pred < DRY_THRESHOLD] = 0
+                # U_pred[U_pred < DRY_THRESHOLD] = 0
                 
-                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='bilinear')
+                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='area')
                 data_loss = criterion(U_pred, batch_u_out_lr)
                 
                 # STAGE 1: Standard FNO training
                 if training_mode == 'Stage1':
                     data_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                     optimizer.step()
                     total_fnoloss += data_loss.item() * bs
                     continue
@@ -286,7 +288,7 @@ def train_model(rank, world_size,
             with torch.no_grad():
                 for batch_data in eval_loader:
                     batch_data = [item.to(rank) for item in batch_data]
-                    v_forcing, v_sol = batch_data[0], batch_data[1]
+                    v_forcing, v_sol = batch_data[0][..., ::2], batch_data[1][..., ::2]
                     v_u0, v_hr = v_sol[..., :T_in], v_sol[..., T_in:]
 
                     bs_v = v_u0.shape[0]
@@ -296,7 +298,7 @@ def train_model(rank, world_size,
                     # Global Validation
                     v_coarse_pred = model(v_forcing, v_u0, v_topo)
                     v_coarse_pred[v_coarse_pred < DRY_THRESHOLD] = 0
-                    total_valloss += criterion(v_coarse_pred, coarsen_spatial_tensor(v_hr, N=f)).item() * bs_v
+                    total_valloss += criterion(v_coarse_pred, coarsen_spatial_tensor(v_hr, N=f, mode='area')).item() * bs_v
 
                     if training_mode == 'Stage1': continue
 
@@ -372,13 +374,12 @@ def train_model(rank, world_size,
                     print(f"\n[Checkpoint] Saved Epoch {ep+1} for {training_mode}")
 
                 outer_loop.set_description(f"Epoch {ep + 1}/{epochs} [{training_mode}]")
-                outer_loop.set_postfix(fno_v=f'{epoch_valloss:.2e}', mag_v=f'{epoch_val_magloss:.2e}')
+                outer_loop.set_postfix(fno_train=f'{epoch_fnoloss:.2e}', fno_val=f'{epoch_valloss:.2e}', 
+                                       mag_train=f'{epoch_magloss:.2e}', mag_val=f'{epoch_val_magloss:.2e}')
 
             scheduler.step()
 
     cleanup()
-
-
 # %%
 def main(
     enable_ig_loss,
@@ -558,14 +559,11 @@ if __name__ == "__main__":
     scheduler_step = train_cfg['scheduler_step']
     scheduler_gamma = train_cfg['scheduler_gamma']
 
-
     data_mask_cfg = cfg['data_mask']
     mask = data_mask_cfg['mask']
     csv_path = data_mask_cfg['csv_path']
     L_x = data_mask_cfg['L_x']
     L_y = data_mask_cfg['L_y']
-
-
 
     # 6. Model Parameters
     m_cfg = cfg['model']

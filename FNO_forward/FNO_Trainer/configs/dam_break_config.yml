@@ -14,20 +14,20 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'dam_break'
-  tag: 'test_mag_residual_model5'
+  tag: 'test_mag_residual_model5_Deeper'
   training_mode: 'Stage1' # Options: Stage1, Stage2, Stage3
-  enable_ig_loss: false
-  save_results: false
-  train_size: 5
-  eval_size: 5
+  enable_ig_loss: False
+  save_results: True
+  train_size: 300
+  eval_size: 150
   seed: 42
 
 
 # Global Hyperparameters
 training:
-  batch_size: 4
+  batch_size: 2
   epochs: 500
-  learning_rate: 0.001
+  learning_rate: 0.0001
   scheduler_step: 50
   scheduler_gamma: 0.95
 
@@ -36,19 +36,19 @@ model:
   operator_type: 'FNO' # Options: CNO, FNO, WNO, DeepONet
   nx: 328
   ny: 164
-  total_steps: 97
+  total_steps: 49
   t_in: 1
   magnification_factor: 4
 
 # Architecture-Specific Settings
 fno:
-  mode_x: 6
-  mode_y: 6
-  mode_t: 6
+  mode_x: 8
+  mode_y: 8
+  mode_t: 8
   width: 20
 
 data_mask:
-  mask: false
-  csv_path: None
-  L_x: None
-  L_y: None
+  mask: True
+  csv_path: 'data/dam_break/DEM_data/dam_up.csv'
+  L_x: 26460.0
+  L_y: 20940.0

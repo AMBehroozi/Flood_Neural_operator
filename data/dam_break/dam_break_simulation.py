@@ -184,7 +184,7 @@ if __name__ == "__main__":
 
     # Raw Input Variables
     data_dir = '/storage/work/amb10399/project/MHPI_FLOOD/Hurricane_Matthew_Flood/data/dam_break'
-    senarios_path = '/storage/group/cxs1024/default/mehdi/dam_break/scenario_groups_1'
+    senarios_path = '/storage/group/cxs1024/default/mehdi/dam_break/scenario_groups_2'
     topography_file = os.path.join(data_dir, 'DEM_data/rectified_local_dem.asc')
     finer_zone_path = os.path.join(data_dir, 'DEM_data/dam_break_finer_area_final.csv')
 
