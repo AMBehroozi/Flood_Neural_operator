@@ -14,7 +14,7 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'dam_break'
-  tag: 'test_mag_residual_model5_Deeper2'
+  tag: 'test_mag_residual_model5_Deeper2_3'
   training_mode: 'Stage1' # Options: Stage1, Stage2, Stage3
   enable_ig_loss: False
   save_results: True

@@ -27,9 +27,7 @@ sys.path.append("./")
 from lib.utilities3 import ensure_directory, check_if_from_ddp, adjust_state_dict
 from lib.utiltools import loss_live_plot, AutomaticWeightedLoss
 
-from models.fno3d_encoder2 import FNO3d
-# from models.magnifier import MagnifierModel as magnifier
-# from models.magnifier1 import Deep3DMagnifier as magnifier
+from models.fno3d_encoder import FNO3d
 from models.magnifier5 import FiLMLightMagnifier as magnifier
 
 from lib.helper import LargeHydrologyDataset, PaddedIndexProvider, prepare_patch_input, BathtubReconstructor   
@@ -166,8 +164,9 @@ def train_model(rank, world_size,
             for batch_data in train_loader:
                 batch_data = [item.to(rank) for item in batch_data]
                 batch_forcing  = batch_data[0][..., ::2]
-                batch_u0       = torch.ones_like(batch_data[1][..., ::2][..., :T_in])
+                # batch_u0       = torch.ones_like(batch_data[1][..., ::2][..., :T_in])
                 
+                batch_u0       = batch_data[1][..., ::2][..., :T_in]
                 batch_u_out_hr = batch_data[1][..., ::2][..., T_in:] 
                 
                 bs = batch_u0.shape[0]
@@ -384,7 +383,7 @@ def train_model(rank, world_size,
     cleanup()
 # %%
 def main(
-    config,
+    config_arg,
     enable_ig_loss,
     save_results,
     global_checkpoint_path,
@@ -502,7 +501,7 @@ def main(
         train_model,
         args=(
             world_size,
-            config, 
+            config_arg, 
             training_mode, 
             model_fn, magnifier_fn, awl_fn, 
             learning_rate,
@@ -527,7 +526,7 @@ def main(
 
 if __name__ == "__main__":
     # 1. Initialization & Config Loading
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')
     run_nvidia_smi()
     MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")

@@ -9,6 +9,196 @@ import torch.nn.functional as F
 import torch.nn as nn
 import gc
 
+
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.patches as mpatches
+
+
+def plot_ever_inundation_confusion(
+    u_true,
+    u_pred,
+    sample_idx=None,        # if int -> plot that sample; if None -> plot across all samples (mode per pixel)
+    inund_th=0.01,
+    stride_t=None,          # e.g. 4 to use [..., ::4]; None = no striding
+    extent=None,            # e.g. [0, X_range, 0, Y_range]; None = pixel coords
+    title_prefix="",
+    figsize=(8, 6),
+):
+    """
+    Plot TN/FP/FN/TP confusion map for ever-inundated (max over time > inund_th),
+    and PRINT organized confusion counts + 2x2 matrix.
+
+    u_true/u_pred can be torch tensors or numpy arrays.
+    Expected shapes:
+      - single sample: (nx, ny, nt)
+      - many samples:  (N, nx, ny, nt)
+    """
+
+    # ---- helpers ----
+    def as_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x
+        return torch.from_numpy(np.asarray(x))
+
+    def fmt_int(n: int) -> str:
+        return f"{n:,}"
+
+    ut = as_tensor(u_true)
+    up = as_tensor(u_pred)
+
+    # ---- optional time stride ----
+    if stride_t is not None:
+        ut = ut[..., ::stride_t]
+        up = up[..., ::stride_t]
+
+    # ---- ensure shapes match ----
+    if ut.shape != up.shape:
+        raise ValueError(f"Shape mismatch: true {tuple(ut.shape)} vs pred {tuple(up.shape)}")
+
+    # ---- colormap ----
+    cmap = ListedColormap(["#d9d9d9", "#ff0000", "#66d9ff", "#08306b"])  # TN, FP, FN, TP
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+    legend_patches = [
+        mpatches.Patch(color="#d9d9d9", label="TN (Correct dry)"),
+        mpatches.Patch(color="#ff0000", label="FP (False alarm)"),
+        mpatches.Patch(color="#66d9ff", label="FN (Missed flood)"),
+        mpatches.Patch(color="#08306b", label="TP (Correct wet)"),
+    ]
+
+    # ---- compute & plot ----
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    if sample_idx is not None:
+        if ut.ndim == 4:
+            ut_s = ut[sample_idx]
+            up_s = up[sample_idx]
+        elif ut.ndim == 3:
+            ut_s = ut
+            up_s = up
+        else:
+            raise ValueError(f"Unsupported ndim for sample plot: {ut.ndim}")
+
+        true_max = torch.max(ut_s, dim=-1).values
+        pred_max = torch.max(up_s, dim=-1).values
+
+        true_wet = true_max > inund_th
+        pred_wet = pred_max > inund_th
+
+        tn = (~true_wet) & (~pred_wet)
+        fp = (~true_wet) & ( pred_wet)
+        fn = ( true_wet) & (~pred_wet)
+        tp = ( true_wet) & ( pred_wet)
+
+        # map codes
+        codes = torch.zeros_like(true_wet, dtype=torch.uint8)
+        codes[fp] = 1
+        codes[fn] = 2
+        codes[tp] = 3
+        img = codes.detach().cpu().numpy()
+
+        ax.imshow(img.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+        ax.set_title(f"{title_prefix}Ever-inundation confusion (sample={sample_idx}, th={inund_th} m)", fontsize=14)
+
+        TN = int(tn.sum().item())
+        FP = int(fp.sum().item())
+        FN = int(fn.sum().item())
+        TP = int(tp.sum().item())
+
+        header = f"Confusion counts (sample={sample_idx}, th={inund_th} m)"
+        total = TN + FP + FN + TP
+
+    else:
+        if ut.ndim != 4:
+            raise ValueError("For across-samples plot, expected shape (N, nx, ny, nt).")
+
+        true_max = torch.max(ut, dim=-1).values
+        pred_max = torch.max(up, dim=-1).values
+
+        true_wet = true_max > inund_th
+        pred_wet = pred_max > inund_th
+
+        tn = (~true_wet) & (~pred_wet)
+        fp = (~true_wet) & ( pred_wet)
+        fn = ( true_wet) & (~pred_wet)
+        tp = ( true_wet) & ( pred_wet)
+
+        TN = int(tn.sum().item())
+        FP = int(fp.sum().item())
+        FN = int(fn.sum().item())
+        TP = int(tp.sum().item())
+
+        header = f"Confusion counts (ALL samples + pixels, th={inund_th} m)"
+        total = TN + FP + FN + TP
+
+        # mode map
+        counts = torch.stack([tn.sum(0), fp.sum(0), fn.sum(0), tp.sum(0)], dim=0)
+        mode_map = torch.argmax(counts, dim=0).to(torch.uint8).detach().cpu().numpy()
+
+        ax.imshow(mode_map.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+        ax.set_title(f"{title_prefix}Across-samples confusion (MODE per pixel, th={inund_th} m)", fontsize=14)
+
+    # ---- organized printout (with percentages) ----
+    cm = np.array([[TN, FP],
+                   [FN, TP]], dtype=np.int64)
+
+    def pct(x, total):
+        return 100.0 * x / total if total > 0 else float("nan")
+
+    total = TN + FP + FN + TP
+
+    acc = (TP + TN) / total if total > 0 else float("nan")
+    wet_recall = TP / (TP + FN) if (TP + FN) > 0 else float("nan")      # TPR / POD
+    wet_precision = TP / (TP + FP) if (TP + FP) > 0 else float("nan")   # PPV
+    f1 = (2 * wet_precision * wet_recall / (wet_precision + wet_recall)
+          if np.isfinite(wet_precision) and np.isfinite(wet_recall) and (wet_precision + wet_recall) > 0
+          else float("nan"))
+
+    print("\n" + header)
+    print("-" * len(header))
+    print(f"TP (Correct wet)      : {fmt_int(TP)}  ({pct(TP, total):6.2f}%)")
+    print(f"TN (Correct dry)      : {fmt_int(TN)}  ({pct(TN, total):6.2f}%)")
+    print(f"FP (False alarm wet)  : {fmt_int(FP)}  ({pct(FP, total):6.2f}%)")
+    print(f"FN (Missed wet)       : {fmt_int(FN)}  ({pct(FN, total):6.2f}%)")
+    print(f"Total pixels counted  : {fmt_int(total)}  (100.00%)")
+    print()
+    print("Confusion matrix [[TN, FP],[FN, TP]]:")
+    print(cm)
+    print()
+    print(f"Accuracy              : {acc:.4f}")
+    print(f"Wet Precision (PPV)   : {wet_precision:.4f}")
+    print(f"Wet Recall (TPR/POD)  : {wet_recall:.4f}")
+    print(f"F1 (wet)              : {f1:.4f}")
+
+
+
+
+    # ---- plot cosmetics ----
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.set_xlabel("Easting (m)" if extent is not None else "X")
+    ax.set_ylabel("Northing (m)" if extent is not None else "Y")
+    ax.legend(handles=legend_patches, loc="lower left", frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+
+
+def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_enabled, SAVED_MODEL_PATH):
+    """Constructs the standard checkpoint filename and path."""
+    ig_tag = "IG_Enable" if ig_enabled else "IG_Disable"
+    parts = [
+        f"saved_model_{case}",
+        ig_tag,
+        f"Nx_{nx}", f"Ny_{ny}",
+        f"Tin_{t_in}", f"Tout_{t_out}",
+        f"Samp_{tag}",
+        f"{op_type}_DDP_{train_size}"
+    ]
+    filename = "_".join(parts) + ".pth"
+    return os.path.join(SAVED_MODEL_PATH, filename), "_".join(parts[1:])
+
+
+
 class BathtubReconstructor(nn.Module):
     def __init__(self, topo_patch, f, max_iters=20):
         super().__init__()
