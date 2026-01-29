@@ -18,7 +18,7 @@ experiment:
   training_mode: 'Stage1' # Options: Stage1, Stage2, Stage3
   enable_ig_loss: False
   save_results: True
-  train_size: 100
+  train_size: 300
   eval_size: 150
   seed: 42
 
@@ -48,9 +48,9 @@ model:
 #   width: 20
 
 fno:
-  mode_x: 10
-  mode_y: 10
-  mode_t: 10
+  mode_x: 12
+  mode_y: 12
+  mode_t: 12
   width: 32
 
 data_mask:

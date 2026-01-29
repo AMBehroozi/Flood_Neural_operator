@@ -117,6 +117,10 @@ def train_model(rank, world_size,
     train_fnolosses, val_losses, val_maglosses  = [], [], []
     train_losses, train_maglosses = [], []
 
+    # ---- Best Model Tracking ----
+    best_val_loss = float('inf')
+    best_epoch = -1
+
     outer_loop = tqdm(range(epochs), desc="Progress", position=0)
     torch.cuda.empty_cache()
     
@@ -176,8 +180,7 @@ def train_model(rank, world_size,
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
                 U_pred = model(batch_forcing, batch_u0, batch_topo_train)
-                if training_mode == 'Stage2':
-                    U_pred[U_pred < DRY_THRESHOLD] = 0
+                U_pred[U_pred < DRY_THRESHOLD] = 0
                 
                 batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='area')
                 data_loss = criterion(U_pred, batch_u_out_lr)
@@ -350,12 +353,13 @@ def train_model(rank, world_size,
             val_losses.append(epoch_valloss)
             val_maglosses.append(epoch_val_magloss)
 
-            # Logging and Checkpointing
+            # --- 5. LOGGING AND CHECKPOINTING (UPDATED) ---
             if rank == 0:
                 df_main = pd.DataFrame({'Train FNO Loss': train_losses, 'Val FNO Loss': val_losses})
                 df_magnifier = pd.DataFrame({'Train Mag Loss': train_maglosses, 'Val Mag Loss': val_maglosses})
 
                 if save_results and (ep % 5 == 0):
+                    # Current epoch checkpoint
                     checkpoint_data = {
                         'config_arg': config,
                         'training_mode': training_mode,
@@ -375,13 +379,51 @@ def train_model(rank, world_size,
                     torch.save(checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}.pth")
                     print(f"\n[Checkpoint] Saved Epoch {ep+1} for {training_mode}")
 
+                # Check if this is the best model so far
+                if epoch_valloss < best_val_loss:
+                    best_val_loss = epoch_valloss
+                    best_epoch = ep
+                    
+                    # Best model checkpoint
+                    best_checkpoint_data = {
+                        'config_arg': config,
+                        'training_mode': training_mode,
+                        'config': {
+                            'Nx': nx, 'Ny': ny, 'T_in': T_in, 'T_out': T_out,
+                            'N_window': N, 'f_upscale': f, 'dry_threshold': DRY_THRESHOLD,
+                            'Mode1_G':mode1, 'Mode2_G': mode2, 'Mode3_G': mode3, 'width_FNO': width_FNO,
+                            'training_stage': training_mode
+                        },
+                        'epoch': ep,
+                        'best_val_loss': best_val_loss,
+                        'model_state_dict': model.state_dict(),
+                        'magnifier_state_dict': magnifier.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss_df_main': df_main,
+                        'loss_df_magnifier': df_magnifier,
+                    }
+                    torch.save(best_checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}_best.pth")
+                    print(f"\n[Best Model] Saved at Epoch {ep+1} with Val Loss: {best_val_loss:.2e}")
+
                 outer_loop.set_description(f"Epoch {ep + 1}/{epochs} [{training_mode}]")
                 outer_loop.set_postfix(fno_train=f'{epoch_fnoloss:.2e}', fno_val=f'{epoch_valloss:.2e}', 
-                                       mag_train=f'{epoch_magloss:.2e}', mag_val=f'{epoch_val_magloss:.2e}')
+                                       mag_train=f'{epoch_magloss:.2e}', mag_val=f'{epoch_val_magloss:.2e}',
+                                       best_ep=best_epoch+1)
 
             scheduler.step()
 
+    # --- 6. FINAL BEST MODEL SUMMARY ---
+    if rank == 0 and save_results:
+        print(f"\n{'='*60}")
+        print(f"Training Complete!")
+        print(f"Best Model: Epoch {best_epoch+1} with Val Loss: {best_val_loss:.2e}")
+        print(f"Best model saved at: {PATH_saved_models}/best_model_{Mode}.pth")
+        print(f"Latest model saved at: {PATH_saved_models}/saved_model_{Mode}.pth")
+        print(f"{'='*60}\n")
+
     cleanup()
+
+
 # %%
 def main(
     config_arg,
@@ -527,7 +569,7 @@ def main(
 
 if __name__ == "__main__":
     # 1. Initialization & Config Loading
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')
     run_nvidia_smi()
     MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")

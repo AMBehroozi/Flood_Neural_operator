@@ -198,7 +198,7 @@ def plot_ever_inundation_confusion(
 
 
 
-def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_enabled, SAVED_MODEL_PATH):
+def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_enabled, SAVED_MODEL_PATH, if_best=False):
     """Constructs the standard checkpoint filename and path."""
     ig_tag = "IG_Enable" if ig_enabled else "IG_Disable"
     parts = [
@@ -209,8 +209,13 @@ def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_
         f"Samp_{tag}",
         f"{op_type}_DDP_{train_size}"
     ]
-    filename = "_".join(parts) + ".pth"
-    return os.path.join(SAVED_MODEL_PATH, filename), "_".join(parts[1:])
+    if if_best:
+        filename = "_".join(parts) + "_best.pth"
+        mode = "_".join(parts[1:]) + '(best)'
+    else:
+        filename = "_".join(parts) + ".pth"
+        mode = "_".join(parts[1:])
+    return os.path.join(SAVED_MODEL_PATH, filename), mode
 
 
 
