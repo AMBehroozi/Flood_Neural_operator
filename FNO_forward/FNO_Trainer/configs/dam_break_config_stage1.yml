@@ -9,7 +9,7 @@ paths:
   global_checkpoint: null
 
   # mag_checkpoint: 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
-  # global_checkpoint: 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_coarse_FNO_DDP_300.pth'
+  global_checkpoint: 'experiments/dam_break/saved_models/saved_model_dam_break_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_48_Samp_test_mag_residual_model5_Deeper_FNO_DDP_300_b.pth'
 
 # Experiment Metadata
 experiment:
@@ -38,6 +38,8 @@ model:
   ny: 164
   total_steps: 49
   t_in: 1
+  step_time: 2
+  coarsen_mode: 'area'
   magnification_factor: 4
 
 # Architecture-Specific Settings
@@ -48,9 +50,9 @@ model:
 #   width: 20
 
 fno:
-  mode_x: 12
-  mode_y: 12
-  mode_t: 12
+  mode_x: 10
+  mode_y: 10
+  mode_t: 10
   width: 32
 
 data_mask:

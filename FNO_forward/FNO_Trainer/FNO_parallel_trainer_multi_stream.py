@@ -46,6 +46,8 @@ def train_model(rank, world_size,
                 model_fn, magnifier_fn, awl_fn, learning_rate,
                 scheduler_step, scheduler_gamma, 
                 operator_type, T_in, T_out,
+                step_time,
+                coarsen_mode,
                 magnification_factor,
                 width_CNO, depth_CNO, kernel_size, unet_depth,  # CNO inputs
                 mode1, mode2, mode3, width_FNO,                 # FNO inputs
@@ -167,11 +169,10 @@ def train_model(rank, world_size,
             # --- 2. TRAINING BATCH LOOP ---
             for batch_data in train_loader:
                 batch_data = [item.to(rank) for item in batch_data]
-                batch_forcing  = batch_data[0][..., ::2]
-                # batch_u0       = torch.ones_like(batch_data[1][..., ::2][..., :T_in])
+                batch_forcing  = batch_data[0][..., ::step_time]
                 
-                batch_u0       = batch_data[1][..., ::2][..., :T_in]
-                batch_u_out_hr = batch_data[1][..., ::2][..., T_in:] 
+                batch_u0       = batch_data[1][..., ::step_time][..., :T_in]
+                batch_u_out_hr = batch_data[1][..., ::step_time][..., T_in:] 
                 
                 bs = batch_u0.shape[0]
                 total_samples += bs
@@ -180,9 +181,9 @@ def train_model(rank, world_size,
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
                 U_pred = model(batch_forcing, batch_u0, batch_topo_train)
-                U_pred[U_pred < DRY_THRESHOLD] = 0
+                # U_pred[U_pred < DRY_THRESHOLD] = 0
                 
-                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='area')
+                batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode=coarsen_mode)
                 data_loss = criterion(U_pred, batch_u_out_lr)
                 
                 # STAGE 1: Standard FNO training
@@ -292,7 +293,7 @@ def train_model(rank, world_size,
             with torch.no_grad():
                 for batch_data in eval_loader:
                     batch_data = [item.to(rank) for item in batch_data]
-                    v_forcing, v_sol = batch_data[0][..., ::2], batch_data[1][..., ::2]
+                    v_forcing, v_sol = batch_data[0][..., ::step_time], batch_data[1][..., ::step_time]
                     v_u0, v_hr = v_sol[..., :T_in], v_sol[..., T_in:]
 
                     bs_v = v_u0.shape[0]
@@ -302,7 +303,7 @@ def train_model(rank, world_size,
                     # Global Validation
                     v_coarse_pred = model(v_forcing, v_u0, v_topo)
                     v_coarse_pred[v_coarse_pred < DRY_THRESHOLD] = 0
-                    total_valloss += criterion(v_coarse_pred, coarsen_spatial_tensor(v_hr, N=f, mode='area')).item() * bs_v
+                    total_valloss += criterion(v_coarse_pred, coarsen_spatial_tensor(v_hr, N=f, mode=coarsen_mode)).item() * bs_v
 
                     if training_mode == 'Stage1': continue
 
@@ -379,9 +380,14 @@ def train_model(rank, world_size,
                     torch.save(checkpoint_data, f"{PATH_saved_models}/saved_model_{Mode}.pth")
                     print(f"\n[Checkpoint] Saved Epoch {ep+1} for {training_mode}")
 
+                if training_mode == "Stage1":
+                    epoch_valloss_criteria = epoch_valloss
+                else:
+                    epoch_valloss_criteria = epoch_val_magloss
+
                 # Check if this is the best model so far
-                if epoch_valloss < best_val_loss:
-                    best_val_loss = epoch_valloss
+                if epoch_valloss_criteria < best_val_loss:
+                    best_val_loss = epoch_valloss_criteria
                     best_epoch = ep
                     
                     # Best model checkpoint
@@ -437,7 +443,10 @@ def main(
     case, tag,
     batch_size, epochs, learning_rate,
     scheduler_step, scheduler_gamma,
-    operator_type, T_in, T_out, nx, ny,
+    operator_type, T_in, T_out, 
+    step_time,
+    coarsen_mode,
+    nx, ny,
     magnification_factor,
     mask=None, csv_path=None, L_x=None, L_y=None,
     width_CNO=None, depth_CNO=None, kernel_size=None, unet_depth=None,
@@ -550,6 +559,8 @@ def main(
             learning_rate,
             scheduler_step, scheduler_gamma,
             operator_type, T_in, T_out,
+            step_time,
+            coarsen_mode,
             magnification_factor,
             width_CNO, depth_CNO, kernel_size, unet_depth,
             mode1, mode2, mode3, width_FNO,
@@ -569,7 +580,9 @@ def main(
 
 if __name__ == "__main__":
     # 1. Initialization & Config Loading
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage1.yml')
+    
     run_nvidia_smi()
     MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
@@ -617,6 +630,8 @@ if __name__ == "__main__":
     nx, ny = m_cfg['nx'], m_cfg['ny']
     T_in = m_cfg['t_in']
     T_out = m_cfg['total_steps'] - T_in
+    step_time = m_cfg['step_time']
+    coarsen_mode =  m_cfg['coarsen_mode']
     magnification_factor = m_cfg['magnification_factor']
 
     # 7. Model-Specific Logic (e.g., FNO)
@@ -656,7 +671,10 @@ if __name__ == "__main__":
         topo_path, a_path, u_path, train_idx, eval_idx, case, 
         tag, batch_size, 
         epochs, learning_rate, scheduler_step, scheduler_gamma, 
-        operator_type, T_in, T_out, nx=nx, ny=ny,
+        operator_type, T_in, T_out, 
+        step_time,
+        coarsen_mode,
+        nx=nx, ny=ny,
         magnification_factor=magnification_factor,
         mask=mask, csv_path=csv_path, L_x=L_x, L_y=L_y,
         # CNO inputs
