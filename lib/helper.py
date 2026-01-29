@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import matplotlib.patches as mpatches
 
-
 def plot_ever_inundation_confusion(
     u_true,
     u_pred,
@@ -59,6 +58,7 @@ def plot_ever_inundation_confusion(
     # ---- colormap ----
     cmap = ListedColormap(["#d9d9d9", "#ff0000", "#66d9ff", "#08306b"])  # TN, FP, FN, TP
     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+
     legend_patches = [
         mpatches.Patch(color="#d9d9d9", label="TN (Correct dry)"),
         mpatches.Patch(color="#ff0000", label="FP (False alarm)"),
@@ -138,48 +138,63 @@ def plot_ever_inundation_confusion(
         ax.imshow(mode_map.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
         ax.set_title(f"{title_prefix}Across-samples confusion (MODE per pixel, th={inund_th} m)", fontsize=14)
 
-    # ---- organized printout (with percentages) ----
+    # ---- add legend (requested change) ----
+    ax.legend(
+        handles=legend_patches,
+        loc="upper right",
+        frameon=True,
+        fontsize=10,
+        title="Confusion classes",
+        title_fontsize=10,
+    )
+
+    # --- conditional percentage printout (NOT over all pixels) ---
     cm = np.array([[TN, FP],
                    [FN, TP]], dtype=np.int64)
 
-    def pct(x, total):
-        return 100.0 * x / total if total > 0 else float("nan")
+    def pct(num, den):
+        return 100.0 * num / den if den > 0 else float("nan")
 
-    total = TN + FP + FN + TP
+    true_wet = TP + FN
+    true_dry = TN + FP
+    pred_wet = TP + FP
+    pred_dry = TN + FN
+    total    = TP + TN + FP + FN
 
-    acc = (TP + TN) / total if total > 0 else float("nan")
-    wet_recall = TP / (TP + FN) if (TP + FN) > 0 else float("nan")      # TPR / POD
-    wet_precision = TP / (TP + FP) if (TP + FP) > 0 else float("nan")   # PPV
+    wet_recall     = TP / true_wet if true_wet > 0 else float("nan")   # TPR / POD
+    wet_precision  = TP / pred_wet if pred_wet > 0 else float("nan")   # PPV
+    dry_recall     = TN / true_dry if true_dry > 0 else float("nan")   # TNR / Specificity
+    fpr            = FP / true_dry if true_dry > 0 else float("nan")   # False alarm rate
+    fnr            = FN / true_wet if true_wet > 0 else float("nan")   # Miss rate
+    csi            = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else float("nan")  # IoU / CSI
+
+    # F1 (wet class)
     f1 = (2 * wet_precision * wet_recall / (wet_precision + wet_recall)
           if np.isfinite(wet_precision) and np.isfinite(wet_recall) and (wet_precision + wet_recall) > 0
           else float("nan"))
 
     print("\n" + header)
     print("-" * len(header))
-    print(f"TP (Correct wet)      : {fmt_int(TP)}  ({pct(TP, total):6.2f}%)")
-    print(f"TN (Correct dry)      : {fmt_int(TN)}  ({pct(TN, total):6.2f}%)")
-    print(f"FP (False alarm wet)  : {fmt_int(FP)}  ({pct(FP, total):6.2f}%)")
-    print(f"FN (Missed wet)       : {fmt_int(FN)}  ({pct(FN, total):6.2f}%)")
-    print(f"Total pixels counted  : {fmt_int(total)}  (100.00%)")
+    print(f"TP (Correct wet)      : {fmt_int(TP)}")
+    print(f"TN (Correct dry)      : {fmt_int(TN)}")
+    print(f"FP (False alarm wet)  : {fmt_int(FP)}")
+    print(f"FN (Missed wet)       : {fmt_int(FN)}")
+    print(f"True wet  (TP+FN)     : {fmt_int(true_wet)}")
+    print(f"True dry  (TN+FP)     : {fmt_int(true_dry)}")
+    print(f"Pred wet  (TP+FP)     : {fmt_int(pred_wet)}")
+    print(f"Pred dry  (TN+FN)     : {fmt_int(pred_dry)}")
+    print(f"Total pixels          : {fmt_int(total)}")
     print()
-    print("Confusion matrix [[TN, FP],[FN, TP]]:")
-    print(cm)
-    print()
-    print(f"Accuracy              : {acc:.4f}")
-    print(f"Wet Precision (PPV)   : {wet_precision:.4f}")
-    print(f"Wet Recall (TPR/POD)  : {wet_recall:.4f}")
-    print(f"F1 (wet)              : {f1:.4f}")
+    print(f"Wet Recall / POD  (TP/(TP+FN)) : {wet_recall:.4f}  ({pct(TP, true_wet):6.2f}%)")
+    print(f"Wet Precision (TP/(TP+FP))    : {wet_precision:.4f}  ({pct(TP, pred_wet):6.2f}%)")
+    print(f"Dry Recall / TNR  (TN/(TN+FP)) : {dry_recall:.4f}  ({pct(TN, true_dry):6.2f}%)")
+    print(f"\nOveral performance\n")
+    print(f"False Alarm Rate  (FP/(TN+FP)) : {fpr:.4f}  ({pct(FP, true_dry):6.2f}%)")
+    print(f"Miss Rate         (FN/(TP+FN)) : {fnr:.4f}  ({pct(FN, true_wet):6.2f}%)")
+    print(f"CSI / IoU         (TP/(TP+FP+FN)) : {csi:.4f}")
+    print(f"F1-score (wet)     (2PR/(P+R))   : {f1:.4f}")
 
-
-
-
-    # ---- plot cosmetics ----
-    ax.grid(True, linestyle="--", alpha=0.3)
-    ax.set_xlabel("Easting (m)" if extent is not None else "X")
-    ax.set_ylabel("Northing (m)" if extent is not None else "Y")
-    ax.legend(handles=legend_patches, loc="lower left", frameon=True)
-    plt.tight_layout()
-    plt.show()
+    return fig, ax
 
 
 

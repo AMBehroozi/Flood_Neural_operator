@@ -14,11 +14,11 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'dam_break'
-  tag: 'test_mag_residual_model5_Deeper2_3'
+  tag: 'test_mag_residual_model5_Deeper'
   training_mode: 'Stage1' # Options: Stage1, Stage2, Stage3
   enable_ig_loss: False
   save_results: True
-  train_size: 300
+  train_size: 100
   eval_size: 150
   seed: 42
 

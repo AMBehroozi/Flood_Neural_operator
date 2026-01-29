@@ -134,8 +134,8 @@ def train_model(rank, world_size,
     reconstructor = BathtubReconstructor(topo, f=f, max_iters=20).to(rank)
 
     
-    WET_BATCH_QUOTA = 21
-    accumulation_steps = 3 
+    WET_BATCH_QUOTA = 20
+    accumulation_steps = 2 
 
     DRY_THRESHOLD = 0.025
     wet_batches_processed = 0
@@ -176,7 +176,8 @@ def train_model(rank, world_size,
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
                 U_pred = model(batch_forcing, batch_u0, batch_topo_train)
-                # U_pred[U_pred < DRY_THRESHOLD] = 0
+                if training_mode == 'Stage2':
+                    U_pred[U_pred < DRY_THRESHOLD] = 0
                 
                 batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode='area')
                 data_loss = criterion(U_pred, batch_u_out_lr)
@@ -184,7 +185,7 @@ def train_model(rank, world_size,
                 # STAGE 1: Standard FNO training
                 if training_mode == 'Stage1':
                     data_loss.backward()
-                    # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     total_fnoloss += data_loss.item() * bs
                     continue
@@ -526,7 +527,7 @@ def main(
 
 if __name__ == "__main__":
     # 1. Initialization & Config Loading
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')
     run_nvidia_smi()
     MHPI()
     warnings.filterwarnings("ignore", message="incompatible copy of pydevd already imported")
