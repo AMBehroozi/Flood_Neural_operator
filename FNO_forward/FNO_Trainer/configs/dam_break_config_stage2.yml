@@ -14,7 +14,7 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'dam_break'
-  tag: 'test_mag_residual_model5_Deeper_stage2'
+  tag: 'test_mag_residual_model_fno_Deeper_stage2'
   training_mode: 'Stage2' # Options: Stage1, Stage2, Stage3
   enable_ig_loss: False
   save_results: True
@@ -25,7 +25,7 @@ experiment:
 
 # Global Hyperparameters
 training:
-  batch_size: 2
+  batch_size: 2   # basically it is 2
   epochs: 500
   learning_rate: 0.0001
   scheduler_step: 50

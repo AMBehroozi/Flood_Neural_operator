@@ -579,9 +579,16 @@ def main(
 # %%
 
 if __name__ == "__main__":
+    
     # 1. Initialization & Config Loading
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage1.yml')
+    
+    # Dam break
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')    
+    
+    # flooding
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage1.yml')
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage2.yml')
     
     run_nvidia_smi()
     MHPI()
