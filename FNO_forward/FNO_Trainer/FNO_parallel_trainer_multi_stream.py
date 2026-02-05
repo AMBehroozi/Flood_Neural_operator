@@ -36,6 +36,119 @@ from lib.helper import coarsen_spatial_tensor
 from lib.util import run_nvidia_smi, MHPI
 
 
+import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
+
+
+# def build_optimizer_and_scheduler(
+#     model,
+#     magnifier,
+#     training_mode,
+#     learning_rate,
+#     weight_decay,
+#     scheduler_step,
+#     scheduler_gamma,
+# ):
+#     """
+#     Build AdamW optimizer and StepLR scheduler for staged training.
+
+#     Args:
+#         model: Global model (e.g., FNO)
+#         magnifier: FiLM-based magnifier network
+#         training_mode: 'Stage1', 'Stage2', or 'Stage3'
+#         learning_rate: base learning rate
+#         weight_decay: AdamW weight decay
+#         scheduler_step: StepLR step size
+#         scheduler_gamma: StepLR decay factor
+
+#     Returns:
+#         optimizer, scheduler
+#     """
+
+#     param_groups = []
+
+#     if training_mode == 'Stage1':
+#         print('Stage 1: Pre-train Global Model (FNO) only')
+
+#         for p in model.parameters():
+#             p.requires_grad = True
+#         for p in magnifier.parameters():
+#             p.requires_grad = False
+
+#         param_groups.append({
+#             'params': model.parameters(),
+#             'lr': learning_rate,
+#             'weight_decay': weight_decay
+#         })
+
+#     elif training_mode == 'Stage2':
+#         print('Stage 2: Freeze Global Model, Pre-train Magnifier only')
+
+#         for p in model.parameters():
+#             p.requires_grad = False
+#         for p in magnifier.parameters():
+#             p.requires_grad = True
+
+#         param_groups.append({
+#             'params': magnifier.parameters(),
+#             'lr': learning_rate,
+#             'weight_decay': weight_decay
+#         })
+
+#     elif training_mode == 'Stage3':
+#         print('Stage 3: End-to-End Fine-tuning (Global + Magnifier)')
+
+#         for p in model.parameters():
+#             p.requires_grad = True
+#         for p in magnifier.parameters():
+#             p.requires_grad = True
+
+#         # Global model: conservative updates
+#         param_groups.append({
+#             'params': model.parameters(),
+#             'lr': learning_rate * 0.1,
+#             'weight_decay': weight_decay
+#         })
+
+#         # Magnifier: main learner
+#         param_groups.append({
+#             'params': magnifier.parameters(),
+#             'lr': learning_rate,
+#             'weight_decay': weight_decay
+#         })
+
+#     else:
+#         raise ValueError(
+#             f"Invalid training_mode: '{training_mode}'. "
+#             "Must be 'Stage1', 'Stage2', or 'Stage3'."
+#         )
+
+#     optimizer = AdamW(
+#         param_groups,
+#         betas=(0.9, 0.999),
+#         eps=1e-8
+#     )
+
+#     scheduler = StepLR(
+#         optimizer,
+#         step_size=scheduler_step,
+#         gamma=scheduler_gamma
+#     )
+
+#     return optimizer, scheduler
+
+# optimizer, scheduler = build_optimizer_and_scheduler(
+#     model=model,
+#     magnifier=magnifier,
+#     training_mode=training_mode,
+#     learning_rate=5e-4,
+#     weight_decay=1e-4,
+#     scheduler_step=50,
+#     scheduler_gamma=0.5,
+# )
+
+
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
@@ -43,12 +156,15 @@ def load_config(config_path):
 def train_model(rank, world_size,
                 config, 
                 training_mode,
+                UQ_mode,
                 model_fn, magnifier_fn, awl_fn, learning_rate,
                 scheduler_step, scheduler_gamma, 
                 operator_type, T_in, T_out,
                 step_time,
                 coarsen_mode,
                 magnification_factor,
+                magnifier_window_size,
+                WET_BATCH_QUOTA, accumulation_steps,
                 width_CNO, depth_CNO, kernel_size, unet_depth,  # CNO inputs
                 mode1, mode2, mode3, width_FNO,                 # FNO inputs
                 wavelet, level, layers, grid_range, width_WNO,  # WNO inputs
@@ -98,13 +214,37 @@ def train_model(rank, world_size,
     scheduler = StepLR(optimizer, step_size=scheduler_step, gamma=scheduler_gamma)
 
 
-    # ---- Static topo ----
-    topo = torch.load(topo_path, map_location='cpu').to(rank)
-    GLOBAL_TOPO_MIN = topo.min()
-    GLOBAL_TOPO_MAX = topo.max()
-    TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
+    
     # ---- Dataset / loaders ----
-    full_dataset = LargeHydrologyDataset(a_path, u_path, mask=mask, csv_path=csv_path, Lx=L_x, Ly=L_y)
+    if not UQ_mode:
+        full_dataset = LargeHydrologyDataset(
+            a_path,
+            u_path,
+            mask=mask,
+            csv_path=csv_path,
+            Lx=L_x,
+            Ly=L_y,
+        )
+        topo = torch.load(topo_path, map_location='cpu').to(rank) # ---- Static topo ----
+        GLOBAL_TOPO_MIN = topo.min()
+        GLOBAL_TOPO_MAX = topo.max()
+        TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
+
+    else:
+        full_dataset = LargeHydrologyDataset(
+            a_path,
+            u_path,
+            topo_path,
+            mask=mask,
+            csv_path=csv_path,
+            Lx=L_x,
+            Ly=L_y,
+        )
+        GLOBAL_TOPO_MIN = full_dataset.b.min()
+        GLOBAL_TOPO_MAX = full_dataset.b.max()
+        TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
+
+
     train_dataset = Subset(full_dataset, train_idx)
     eval_dataset  = Subset(full_dataset, eval_idx)
 
@@ -127,7 +267,7 @@ def train_model(rank, world_size,
     torch.cuda.empty_cache()
     
     nx, ny, _ = train_dataset[0][0].shape
-    N = 5
+    N = magnifier_window_size
     f = magnification_factor
     mx = int(nx/magnification_factor)
     my = int(ny/magnification_factor)
@@ -137,15 +277,11 @@ def train_model(rank, world_size,
     index_provider = PaddedIndexProvider(mx=mx, my=my, N=N, batch_size=32, subset_fraction=1.0)
     
     # --- NEW: Initialize the Physics Reconstructor ---
-    reconstructor = BathtubReconstructor(topo, f=f, max_iters=20).to(rank)
-
+    # reconstructor = BathtubReconstructor(topo, f=f, max_iters=20).to(rank)
+    reconstructor = BathtubReconstructor(f=f, max_iters=20).to(rank)
     
-    WET_BATCH_QUOTA = 20
-    accumulation_steps = 2 
-
     DRY_THRESHOLD = 0.025
-    wet_batches_processed = 0
-
+    SHALLOW_THRESHOLD = 1.5
 
     for ep in outer_loop:
             train_sampler.set_epoch(ep)
@@ -176,7 +312,14 @@ def train_model(rank, world_size,
                 
                 bs = batch_u0.shape[0]
                 total_samples += bs
-                batch_topo_train = topo.expand(bs, -1, -1)
+                # batch_topo_train = topo.expand(bs, -1, -1)
+
+                # If B exists in the dataloader output, use it; otherwise use expanded topo
+                if UQ_mode:
+                    batch_topo_train = batch_data[2]          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                else:
+                    batch_topo_train = topo.expand(bs, -1, -1)
+
                 # batch_topo_norm = (batch_topo_train - GLOBAL_TOPO_MIN) / TOPO_RANGE
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
@@ -227,7 +370,14 @@ def train_model(rank, world_size,
                     batch_patches_in, batch_patches_bt, batch_patches_trgt = [], [], []
                     for (i_s, j_s) in spatial_batch:
                         p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
-                        if p_target.max() < 0.025: continue 
+                        
+                        is_wet = p_target.max() >= DRY_THRESHOLD
+                        is_shallow_boundary = p_target.min() < SHALLOW_THRESHOLD
+
+                        if not (is_wet and is_shallow_boundary):
+                            continue 
+
+                        # if p_target.max() < DRY_THRESHOLD: continue 
 
                         # --- UPDATED: Prepare 3-channel input ---
                         p_in = prepare_patch_input(u_pad, topo_pad, i_s, j_s, N, f, rank, u_bathtub=u_bt_pad)
@@ -257,7 +407,7 @@ def train_model(rank, world_size,
                         (mag_loss_patch / accumulation_steps).backward()
                         if (wet_batches_processed + 1) % accumulation_steps == 0:
                             optimizer.step()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+                            torch.nn.utils.clip_grad_norm_(magnifier.parameters(), 1.0)
                             optimizer.zero_grad(set_to_none=True)
                     
                     # STAGE 3: Aggregate loss for single backward
@@ -298,7 +448,14 @@ def train_model(rank, world_size,
 
                     bs_v = v_u0.shape[0]
                     total_val_samples += bs_v
-                    v_topo = topo.expand(bs_v, -1, -1)
+                    # v_topo = topo.expand(bs_v, -1, -1)
+
+                    # If B exists in the dataloader output, use it; otherwise use expanded topo
+                    if UQ_mode:
+                        v_topo = batch_data[2]          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                    else:
+                        v_topo = topo.expand(bs, -1, -1)
+
 
                     # Global Validation
                     v_coarse_pred = model(v_forcing, v_u0, v_topo)
@@ -386,7 +543,7 @@ def train_model(rank, world_size,
                     epoch_valloss_criteria = epoch_val_magloss
 
                 # Check if this is the best model so far
-                if epoch_valloss_criteria < best_val_loss:
+                if (epoch_valloss_criteria < best_val_loss) and save_results:
                     best_val_loss = epoch_valloss_criteria
                     best_epoch = ep
                     
@@ -438,6 +595,7 @@ def main(
     global_checkpoint_path,
     mag_checkpoint_path,
     training_mode,
+    UQ_mode,
     topo_path, a_path, u_path,
     train_idx, eval_idx,
     case, tag,
@@ -448,6 +606,8 @@ def main(
     coarsen_mode,
     nx, ny,
     magnification_factor,
+    magnifier_window_size,
+    WET_BATCH_QUOTA, accumulation_steps,
     mask=None, csv_path=None, L_x=None, L_y=None,
     width_CNO=None, depth_CNO=None, kernel_size=None, unet_depth=None,
     mode1=None, mode2=None, mode3=None, width_FNO=None,
@@ -554,7 +714,8 @@ def main(
         args=(
             world_size,
             config_arg, 
-            training_mode, 
+            training_mode,
+            UQ_mode, 
             model_fn, magnifier_fn, awl_fn, 
             learning_rate,
             scheduler_step, scheduler_gamma,
@@ -562,6 +723,8 @@ def main(
             step_time,
             coarsen_mode,
             magnification_factor,
+            magnifier_window_size,
+            WET_BATCH_QUOTA, accumulation_steps,
             width_CNO, depth_CNO, kernel_size, unet_depth,
             mode1, mode2, mode3, width_FNO,
             wavelet, level, layers, grid_range, width_WNO,
@@ -583,14 +746,14 @@ if __name__ == "__main__":
     # 1. Initialization & Config Loading
     
     # Dam break
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage1.yml')    
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage2.yml')    
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break_config_stage3.yml')    
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage1_UQ.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage2.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage3.yml')    
 
     # flooding
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage1.yml')
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage2.yml')
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding_config_stage2.yml')
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding/flooding_config_stage1.yml')
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding/flooding_config_stage2.yml')
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding/flooding_config_stage2.yml')
    
     run_nvidia_smi()
     MHPI()
@@ -609,6 +772,7 @@ if __name__ == "__main__":
     exp = cfg['experiment']
     case, tag = exp['case'], exp['tag']
     training_mode = exp['training_mode']
+    UQ_mode = exp['UQ_mode']
     enable_ig_loss, save_results = exp['enable_ig_loss'], exp['save_results']
 
     # 4. Dataset Initialization & Deterministic Splitting
@@ -642,6 +806,9 @@ if __name__ == "__main__":
     step_time = m_cfg['step_time']
     coarsen_mode =  m_cfg['coarsen_mode']
     magnification_factor = m_cfg['magnification_factor']
+    magnifier_window_size = m_cfg['magnifier_window_size']
+    WET_BATCH_QUOTA = m_cfg['WET_BATCH_QUOTA'] 
+    accumulation_steps = m_cfg['accumulation_steps']
 
     # 7. Model-Specific Logic (e.g., FNO)
     fno_cfg =   cfg['fno']
@@ -677,6 +844,7 @@ if __name__ == "__main__":
         global_checkpoint_path, 
         mag_checkpoint_path,
         training_mode,
+        UQ_mode,
         topo_path, a_path, u_path, train_idx, eval_idx, case, 
         tag, batch_size, 
         epochs, learning_rate, scheduler_step, scheduler_gamma, 
@@ -685,6 +853,9 @@ if __name__ == "__main__":
         coarsen_mode,
         nx=nx, ny=ny,
         magnification_factor=magnification_factor,
+        magnifier_window_size=magnifier_window_size,
+        WET_BATCH_QUOTA=WET_BATCH_QUOTA, 
+        accumulation_steps=accumulation_steps,
         mask=mask, csv_path=csv_path, L_x=L_x, L_y=L_y,
         # CNO inputs
         width_CNO=width_CNO if operator_type == 'CNO' else None,

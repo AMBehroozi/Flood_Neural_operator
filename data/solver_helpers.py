@@ -9,6 +9,141 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 
+def _smoothstep(t):
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _value_noise_2d(shape, grid_shape, rng):
+    """
+    Perlin-like *value noise*:
+    - Create a coarse random grid
+    - Bilinearly interpolate to full resolution
+    - Use smoothstep for smoother gradients
+    """
+    H, W = shape
+    gh, gw = grid_shape
+
+    # Random values on coarse lattice
+    lattice = rng.uniform(-1.0, 1.0, size=(gh + 1, gw + 1))
+
+    # Coordinates in coarse grid space
+    ys = np.linspace(0, gh, H, endpoint=False)
+    xs = np.linspace(0, gw, W, endpoint=False)
+
+    y0 = np.floor(ys).astype(int)
+    x0 = np.floor(xs).astype(int)
+    y1 = y0 + 1
+    x1 = x0 + 1
+
+    fy = ys - y0
+    fx = xs - x0
+    fy = _smoothstep(fy)
+    fx = _smoothstep(fx)
+
+    # Broadcast to 2D
+    y0 = y0[:, None]
+    y1 = y1[:, None]
+    x0 = x0[None, :]
+    x1 = x1[None, :]
+
+    fy = fy[:, None]
+    fx = fx[None, :]
+
+    v00 = lattice[y0, x0]
+    v10 = lattice[y1, x0]
+    v01 = lattice[y0, x1]
+    v11 = lattice[y1, x1]
+
+    vx0 = v00 * (1 - fx) + v01 * fx
+    vx1 = v10 * (1 - fx) + v11 * fx
+    vxy = vx0 * (1 - fy) + vx1 * fy
+    return vxy
+
+
+def _fractal_noise_2d(shape, base_grid=(8, 8), octaves=4, lacunarity=2.0, persistence=0.5, seed=0):
+    """
+    Multi-octave coherent noise (fractal / fBm style).
+    """
+    rng = np.random.default_rng(seed)
+    H, W = shape
+
+    noise = np.zeros((H, W), dtype=np.float32)
+    amp = 1.0
+    freq_h, freq_w = base_grid
+
+    amp_sum = 0.0
+    for _ in range(octaves):
+        n = _value_noise_2d((H, W), (int(freq_h), int(freq_w)), rng)
+        noise += amp * n.astype(np.float32)
+        amp_sum += amp
+
+        amp *= persistence
+        freq_h *= lacunarity
+        freq_w *= lacunarity
+
+    noise /= max(amp_sum, 1e-8)
+    return noise
+
+
+def add_coherent_noise_to_dem_ascii(
+    input_dem_path,
+    output_dem_path,
+    amplitude_m=0.5,
+    base_grid=(8, 8),
+    octaves=4,
+    lacunarity=2.0,
+    persistence=0.5,
+    seed=42,
+    mode="std"  # "std" or "max"
+):
+    """
+    Add spatially coherent multi-scale noise to ESRI ASCII DEM and save.
+
+    amplitude_m:
+      - if mode="std": scales noise to have std = amplitude_m (meters)
+      - if mode="max": scales noise so max(|noise|) = amplitude_m (meters)
+    """
+    # Read DEM
+    with open(input_dem_path, "r") as f:
+        header = [next(f) for _ in range(6)]
+        data = np.loadtxt(f)
+
+    # Parse NODATA
+    nodata_value = None
+    for line in header:
+        if "NODATA_value" in line or "nodata_value" in line:
+            nodata_value = float(line.split()[-1])
+            break
+    if nodata_value is None:
+        raise ValueError("No NODATA_value found in header.")
+
+    mask = data != nodata_value
+
+    # Generate coherent noise field
+    n = _fractal_noise_2d(data.shape, base_grid=base_grid, octaves=octaves,
+                          lacunarity=lacunarity, persistence=persistence, seed=seed)
+
+    # Scale noise
+    if mode == "std":
+        s = float(n[mask].std()) if mask.any() else float(n.std())
+        n = n * (amplitude_m / max(s, 1e-8))
+    elif mode == "max":
+        m = float(np.max(np.abs(n[mask]))) if mask.any() else float(np.max(np.abs(n)))
+        n = n * (amplitude_m / max(m, 1e-8))
+    else:
+        raise ValueError('mode must be "std" or "max"')
+
+    # Apply only to valid cells
+    noisy = data.copy()
+    noisy[mask] = data[mask] + n[mask]
+
+    # Write output
+    with open(output_dem_path, "w") as f:
+        for line in header:
+            f.write(line)
+        np.savetxt(f, noisy, fmt="%.4f")
+
+    return output_dem_path
 
 # Function to merge parallel ANUGA SWW files
 def merge_sww_files(directory='results', output_name='merged.sww', 

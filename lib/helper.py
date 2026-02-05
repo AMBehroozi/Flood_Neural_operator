@@ -14,6 +14,45 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import matplotlib.patches as mpatches
 
+
+
+def scale_spatial_resolution(u, N):
+    """
+    Fast spatial interpolation for 4D tensors with shape [nb, nx, ny, nt].
+    
+    This function upscales or downscales the spatial dimensions (nx, ny) by a factor N
+    while preserving the batch and time dimensions.
+    
+    Args:
+        u: Input tensor of shape [nb, nx, ny, nt]
+           - nb: batch size
+           - nx, ny: spatial dimensions (height, width)
+           - nt: number of time steps
+        N: Scaling factor for spatial resolution (e.g., 2.0 doubles resolution)
+    
+    Returns:
+        Interpolated tensor of shape [nb, new_nx, new_ny, nt]
+        where new_nx = int(nx * N) and new_ny = int(ny * N)
+    """
+    nb, nx, ny, nt = u.shape
+    
+    new_nx, new_ny = int(nx * N), int(ny * N)
+    
+    u_permuted = u.permute(0, 3, 1, 2)  # [nb, nt, nx, ny]
+    
+    u_reshaped = u_permuted.reshape(nb * nt, 1, nx, ny)  # [nb*nt, 1, nx, ny]
+    
+    u_interpolated = F.interpolate(
+        u_reshaped,
+        size=(new_nx, new_ny),  # Target spatial dimensions
+        mode='area',             # Interpolation method
+        antialias=False          # Speed vs quality tradeoff
+    )  # Output shape: [nb*nt, 1, new_nx, new_ny]
+
+    u_interpolated = u_interpolated.reshape(nb, nt, new_nx, new_ny)  # [nb, nt, new_nx, new_ny]
+    return u_interpolated.permute(0, 2, 3, 1)  # [nb, new_nx, new_ny, nt]
+
+
 def plot_ever_inundation_confusion(
     u_true,
     u_pred,
@@ -220,54 +259,135 @@ def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_
 
 
 class BathtubReconstructor(nn.Module):
-    def __init__(self, topo_patch, f, max_iters=20):
+    def __init__(self, f: int, max_iters: int = 20):
         super().__init__()
-        self.f = f
-        self.max_iters = max_iters
-        
-        # Ensure topo has 3 dims: [1, Ny_fine, Nx_fine]
-        if topo_patch.dim() == 2:
-            topo_patch = topo_patch.unsqueeze(0)
-        
-        # register_buffer ensures this moves to GPU when you call .to('cuda')
-        self.register_buffer("topo", topo_patch)
+        self.f = int(f)
+        self.max_iters = int(max_iters)
 
-    def forward(self, u_coarse):
-        # Dynamically get the device from the input tensor
-        device = u_coarse.device 
+    @staticmethod
+    def _standardize_topo(topo_patch: torch.Tensor, bs: int, device: torch.device) -> torch.Tensor:
+        """
+        topo_patch:
+          - [Ny_fine, Nx_fine] or [1, Ny_fine, Nx_fine]  -> shared bed
+          - [bs, Ny_fine, Nx_fine]                      -> per-sample bed
+        returns:
+          - [bs, Ny_fine, Nx_fine]
+        """
+        topo_patch = topo_patch.to(device)
+
+        if topo_patch.dim() == 2:
+            topo_patch = topo_patch.unsqueeze(0)  # [1, Nyf, Nxf]
+
+        if topo_patch.dim() != 3:
+            raise ValueError(f"topo_patch must be 2D or 3D, got shape {tuple(topo_patch.shape)}")
+
+        b_topo = topo_patch.size(0)
+        if b_topo == 1:
+            return topo_patch.expand(bs, -1, -1)  # shared, no memory copy
+        if b_topo == bs:
+            return topo_patch  # per-sample
+        raise ValueError(f"topo_patch batch dim must be 1 or bs={bs}, got {b_topo}")
+
+    def forward(self, u_coarse: torch.Tensor, topo_patch: torch.Tensor) -> torch.Tensor:
+        """
+        u_coarse:   [bs, n_y, n_x, n_t]
+        topo_patch: [Ny_fine, Nx_fine] OR [bs, Ny_fine, Nx_fine]
+        returns:    [bs, n_y*f, n_x*f, n_t]
+        """
+        if u_coarse.dim() != 4:
+            raise ValueError(f"u_coarse must be [bs, n_y, n_x, n_t], got {tuple(u_coarse.shape)}")
+
+        device = u_coarse.device
         bs, n_y, n_x, n_t = u_coarse.shape
         f = self.f
         nf_y, nf_x = n_y * f, n_x * f
-        
-        # We use .expand(bs, -1, -1) to make sure the single topo buffer 
-        # matches the incoming batch size u_coarse without copying memory.
-        topo_batch = self.topo.expand(bs, -1, -1)
 
-        # 1. Reshape topo [BS, ny*f, nx*f] -> [BS, ny, f, nx, f]
+        topo_batch = self._standardize_topo(topo_patch, bs, device)
+
+        # Optional sanity check (recommended)
+        if topo_batch.shape[-2:] != (nf_y, nf_x):
+            raise ValueError(
+                f"topo_patch fine shape mismatch. Expected (*, {nf_y}, {nf_x}), got {tuple(topo_batch.shape)}"
+            )
+
+        # Fold topo: [bs, ny*f, nx*f] -> [bs, ny, f, nx, f] -> [bs, ny, nx, 1, f*f]
         topo_folded = topo_batch.view(bs, n_y, f, n_x, f).permute(0, 1, 3, 2, 4)
-        z_fine = topo_folded.reshape(bs, n_y, n_x, 1, f*f)
-        
-        d_target = u_coarse.unsqueeze(-1)
+        z_fine = topo_folded.reshape(bs, n_y, n_x, 1, f * f)
 
-        # Bounds initialization
+        d_target = u_coarse.unsqueeze(-1)  # [bs, ny, nx, nt, 1]
+
+        # Bounds for WSE bisection
         h_low = z_fine.min(dim=-1, keepdim=True)[0]
         h_high = z_fine.max(dim=-1, keepdim=True)[0] + d_target + 1e-3
 
+        # Bisection
         for _ in range(self.max_iters):
             h_mid = (h_low + h_high) / 2.0
             d_mid = torch.relu(h_mid - z_fine).mean(dim=-1, keepdim=True)
-            
             mask = d_mid < d_target
             h_low = torch.where(mask, h_mid, h_low)
             h_high = torch.where(mask, h_high, h_mid)
 
         h_final = (h_low + h_high) / 2.0
-        u_rec = torch.relu(h_final - z_fine) 
+        u_rec = torch.relu(h_final - z_fine)  # [bs, ny, nx, nt, f*f]
 
+        # Unfold to fine grid: [bs, ny, nx, nt, f, f] -> [bs, ny*f, nx*f, nt]
         u_rec = u_rec.view(bs, n_y, n_x, n_t, f, f)
         u_rec = u_rec.permute(0, 1, 4, 2, 5, 3).reshape(bs, nf_y, nf_x, n_t)
 
         return u_rec
+
+
+
+# class BathtubReconstructor(nn.Module):
+#     def __init__(self, topo_patch, f, max_iters=20):
+#         super().__init__()
+#         self.f = f
+#         self.max_iters = max_iters
+        
+#         # Ensure topo has 3 dims: [1, Ny_fine, Nx_fine]
+#         if topo_patch.dim() == 2:
+#             topo_patch = topo_patch.unsqueeze(0)
+        
+#         # register_buffer ensures this moves to GPU when you call .to('cuda')
+#         self.register_buffer("topo", topo_patch)
+
+#     def forward(self, u_coarse):
+#         # Dynamically get the device from the input tensor
+#         device = u_coarse.device 
+#         bs, n_y, n_x, n_t = u_coarse.shape
+#         f = self.f
+#         nf_y, nf_x = n_y * f, n_x * f
+        
+#         # We use .expand(bs, -1, -1) to make sure the single topo buffer 
+#         # matches the incoming batch size u_coarse without copying memory.
+#         topo_batch = self.topo.expand(bs, -1, -1)
+
+#         # 1. Reshape topo [BS, ny*f, nx*f] -> [BS, ny, f, nx, f]
+#         topo_folded = topo_batch.view(bs, n_y, f, n_x, f).permute(0, 1, 3, 2, 4)
+#         z_fine = topo_folded.reshape(bs, n_y, n_x, 1, f*f)
+        
+#         d_target = u_coarse.unsqueeze(-1)
+
+#         # Bounds initialization
+#         h_low = z_fine.min(dim=-1, keepdim=True)[0]
+#         h_high = z_fine.max(dim=-1, keepdim=True)[0] + d_target + 1e-3
+
+#         for _ in range(self.max_iters):
+#             h_mid = (h_low + h_high) / 2.0
+#             d_mid = torch.relu(h_mid - z_fine).mean(dim=-1, keepdim=True)
+            
+#             mask = d_mid < d_target
+#             h_low = torch.where(mask, h_mid, h_low)
+#             h_high = torch.where(mask, h_high, h_mid)
+
+#         h_final = (h_low + h_high) / 2.0
+#         u_rec = torch.relu(h_final - z_fine) 
+
+#         u_rec = u_rec.view(bs, n_y, n_x, n_t, f, f)
+#         u_rec = u_rec.permute(0, 1, 4, 2, 5, 3).reshape(bs, nf_y, nf_x, n_t)
+
+#         return u_rec
 
 
 class PaddedIndexProvider:
@@ -542,62 +662,142 @@ def coarsen_spatial_tensor(tensor, N, mode='avg'):
 
 
 
+# import torch
+# import pandas as pd
+# import numpy as np
+# from torch.utils.data import Dataset
+# from matplotlib.path import Path
+
+
+
+# class LargeHydrologyDataset(Dataset):
+#     def __init__(self, file_a, file_u, m_map=True, mask=False, csv_path=None, Lx=None, Ly=None):
+#         self.m_map = m_map
+#         self.a = torch.load(file_a, mmap=self.m_map, map_location='cpu')
+#         self.u = torch.load(file_u, mmap=self.m_map, map_location='cpu')
+        
+#         self.do_masking = mask
+#         self.spatial_mask = None
+
+#         if self.do_masking:
+#             if csv_path is None or Lx is None or Ly is None:
+#                 raise ValueError("Masking requires csv_path, Lx, and Ly to be defined.")
+            
+#             # Pre-compute the mask during initialization
+#             self.spatial_mask = self._generate_static_mask(csv_path, Lx, Ly)
+
+#     def _generate_static_mask(self, csv_path, Lx, Ly):
+#         """Creates a [nx, ny, 1] mask based on boundary points."""
+#         # Load nx, ny from the loaded data
+#         _, nx, ny, _ = self.a.shape
+        
+#         # Load raw CSV (no headers)
+#         df = pd.read_csv(csv_path, header=None)
+#         points = df[[0, 1]].values 
+        
+#         # Create coordinate grid
+#         x_coords = np.linspace(0, Lx, nx)
+#         y_coords = np.linspace(0, Ly, ny)
+#         xv, yv = np.meshgrid(x_coords, y_coords, indexing='ij')
+#         grid_points = np.vstack((xv.flatten(), yv.flatten())).T
+        
+#         # Point-in-polygon logic
+#         poly_path = Path(points)
+#         mask_flat = poly_path.contains_points(grid_points)
+        
+#         # Convert to tensor and reshape for broadcasting [nx, ny, 1]
+#         mask_2d = torch.from_numpy(mask_flat.reshape(nx, ny))
+#         final_mask = torch.logical_not(mask_2d).float()
+#         return final_mask.unsqueeze(-1) # Shape: [nx, ny, 1]
+
+#     def __len__(self):
+#         return self.a.shape[0]
+
+#     def __getitem__(self, idx):
+#         # Fetch data (mmap keeps this efficient)
+#         sample_a = self.a[idx]
+#         sample_u = self.u[idx]
+
+#         # Apply mask if requested
+#         if self.do_masking and self.spatial_mask is not None:
+#             sample_u = sample_u * self.spatial_mask
+
+#         return sample_a, sample_u
+
+
+
 import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset
 from matplotlib.path import Path
 
+
 class LargeHydrologyDataset(Dataset):
-    def __init__(self, file_a, file_u, m_map=True, mask=False, csv_path=None, Lx=None, Ly=None):
+    def __init__(
+        self,
+        file_a,
+        file_u,
+        file_b=None,          # ← NEW (optional)
+        m_map=True,
+        mask=False,
+        csv_path=None,
+        Lx=None,
+        Ly=None,
+    ):
         self.m_map = m_map
-        self.a = torch.load(file_a, mmap=self.m_map, map_location='cpu')
-        self.u = torch.load(file_u, mmap=self.m_map, map_location='cpu')
-        
+
+        self.a = torch.load(file_a, mmap=self.m_map, map_location="cpu")
+        self.u = torch.load(file_u, mmap=self.m_map, map_location="cpu")
+
+        # Optional third tensor
+        self.has_b = file_b is not None
+        self.b = None
+        if self.has_b:
+            self.b = torch.load(file_b, mmap=self.m_map, map_location="cpu")
+
         self.do_masking = mask
         self.spatial_mask = None
 
         if self.do_masking:
             if csv_path is None or Lx is None or Ly is None:
                 raise ValueError("Masking requires csv_path, Lx, and Ly to be defined.")
-            
+
             # Pre-compute the mask during initialization
             self.spatial_mask = self._generate_static_mask(csv_path, Lx, Ly)
 
     def _generate_static_mask(self, csv_path, Lx, Ly):
         """Creates a [nx, ny, 1] mask based on boundary points."""
-        # Load nx, ny from the loaded data
         _, nx, ny, _ = self.a.shape
-        
-        # Load raw CSV (no headers)
+
         df = pd.read_csv(csv_path, header=None)
-        points = df[[0, 1]].values 
-        
-        # Create coordinate grid
+        points = df[[0, 1]].values
+
         x_coords = np.linspace(0, Lx, nx)
         y_coords = np.linspace(0, Ly, ny)
-        xv, yv = np.meshgrid(x_coords, y_coords, indexing='ij')
+        xv, yv = np.meshgrid(x_coords, y_coords, indexing="ij")
         grid_points = np.vstack((xv.flatten(), yv.flatten())).T
-        
-        # Point-in-polygon logic
+
         poly_path = Path(points)
         mask_flat = poly_path.contains_points(grid_points)
-        
-        # Convert to tensor and reshape for broadcasting [nx, ny, 1]
+
         mask_2d = torch.from_numpy(mask_flat.reshape(nx, ny))
         final_mask = torch.logical_not(mask_2d).float()
-        return final_mask.unsqueeze(-1) # Shape: [nx, ny, 1]
+
+        return final_mask.unsqueeze(-1)  # [nx, ny, 1]
 
     def __len__(self):
         return self.a.shape[0]
 
     def __getitem__(self, idx):
-        # Fetch data (mmap keeps this efficient)
         sample_a = self.a[idx]
         sample_u = self.u[idx]
 
-        # Apply mask if requested
         if self.do_masking and self.spatial_mask is not None:
             sample_u = sample_u * self.spatial_mask
+
+        if self.has_b:
+            sample_b = self.b[idx]
+            return sample_a, sample_u, sample_b
 
         return sample_a, sample_u
