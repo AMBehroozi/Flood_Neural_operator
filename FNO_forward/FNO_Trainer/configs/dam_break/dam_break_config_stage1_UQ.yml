@@ -1,15 +1,15 @@
 # Environment & IO
 paths:
-  main_path: '/storage/group/cxs1024/default/mehdi/dam_break/scenario_groups_UQ'
-  topo_file: 'dam_break_processed_data_bed_UQ.pt'
-  input_file: 'dam_break_processed_data_input_UQ.pt'
-  solution_file: 'dam_break_processed_data_solution_UQ.pt'
+  main_path: '/storage/group/cxs1024/default/mehdi/dam_break/scenario_groups_UQ2'
+  topo_file: 'dam_break_processed_data_bed_UQ2.pt'
+  input_file: 'dam_break_processed_data_input_UQ2.pt'
+  solution_file: 'dam_break_processed_data_solution_UQ2.pt'
 
   mag_checkpoint: null
   global_checkpoint: null
 
   # mag_checkpoint: 'experiments/Hurricane_Matthew/saved_models/saved_model_Hurricane_Matthew_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_88_Samp_test_mag_residual_model5_FNO_DDP_300.pth'
-  # global_checkpoint: 'experiments/dam_break/saved_models/saved_model_dam_break_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_48_Samp_test_mag_residual_model5_Deeper_FNO_DDP_300_b.pth'
+  global_checkpoint: 'experiments/dam_break/saved_models/saved_model_dam_break_IG_Disable_Nx_328_Ny_164_Tin_1_Tout_48_Samp_dam_break_stage1_UQ_C_FNO_DDP_300_best.pth'
 
 # Experiment Metadata
 experiment:
@@ -28,7 +28,7 @@ experiment:
 training:
   batch_size: 2
   epochs: 500
-  learning_rate: 0.0001
+  learning_rate: 0.00005
   scheduler_step: 50
   scheduler_gamma: 0.95
 

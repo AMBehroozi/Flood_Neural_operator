@@ -6,7 +6,7 @@
 #SBATCH -C v100s
 #SBATCH --gpus=4
 #SBATCH --time=24:00:00
-#SBATCH --job-name='DAM_BREAK_UQ_STAGE1'
+#SBATCH --job-name='dam_break_stage1_UQ_C'
 #SBATCH --partition=mgc-mri
 #SBATCH --account=cxs1024_mri
 #SBATCH --output=slurm_log/slurm-%j.out

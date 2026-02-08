@@ -243,6 +243,8 @@ def train_model(rank, world_size,
         GLOBAL_TOPO_MIN = full_dataset.b.min()
         GLOBAL_TOPO_MAX = full_dataset.b.max()
         TOPO_RANGE = GLOBAL_TOPO_MAX - GLOBAL_TOPO_MIN + 1e-7
+        GLOBAL_TOPO_MEAN = full_dataset.b.mean(dim=(0, 1, 2))
+        GLOBAL_TOPO_STD  = full_dataset.b.std(dim=(0, 1, 2)) + 1e-6
 
 
     train_dataset = Subset(full_dataset, train_idx)
@@ -316,7 +318,10 @@ def train_model(rank, world_size,
 
                 # If B exists in the dataloader output, use it; otherwise use expanded topo
                 if UQ_mode:
-                    batch_topo_train = batch_data[2]          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                    # batch_topo_train = (batch_data[2] - GLOBAL_TOPO_MIN) / TOPO_RANGE          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                    batch_topo_train = batch_data[2]
+
+                    # batch_topo_train = (batch_data[2] - GLOBAL_TOPO_MEAN) / GLOBAL_TOPO_STD
                 else:
                     batch_topo_train = topo.expand(bs, -1, -1)
 
@@ -452,7 +457,9 @@ def train_model(rank, world_size,
 
                     # If B exists in the dataloader output, use it; otherwise use expanded topo
                     if UQ_mode:
-                        v_topo = batch_data[2]          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                        # v_topo = (batch_data[2] - GLOBAL_TOPO_MIN) / TOPO_RANGE          # shape should be [bs, nx, ny] (or [bs, nx, ny, 1] etc.)
+                        v_topo = batch_data[2]
+                        # v_topo = batch_topo_train = (batch_data[2] - GLOBAL_TOPO_MEAN) / GLOBAL_TOPO_STD
                     else:
                         v_topo = topo.expand(bs, -1, -1)
 

@@ -53,28 +53,233 @@ def scale_spatial_resolution(u, N):
     return u_interpolated.permute(0, 2, 3, 1)  # [nb, new_nx, new_ny, nt]
 
 
+# def plot_ever_inundation_confusion(
+#     u_true,
+#     u_pred,
+#     sample_idx=None,        # if int -> plot that sample; if None -> plot across all samples (mode per pixel)
+#     inund_th=0.01,
+#     stride_t=None,          # e.g. 4 to use [..., ::4]; None = no striding
+#     extent=None,            # e.g. [0, X_range, 0, Y_range]; None = pixel coords
+#     title_prefix="",
+#     figsize=(8, 6),
+# ):
+#     """
+#     Plot TN/FP/FN/TP confusion map for ever-inundated (max over time > inund_th),
+#     and PRINT organized confusion counts + 2x2 matrix.
+
+#     u_true/u_pred can be torch tensors or numpy arrays.
+#     Expected shapes:
+#       - single sample: (nx, ny, nt)
+#       - many samples:  (N, nx, ny, nt)
+#     """
+
+#     # ---- helpers ----
+#     def as_tensor(x):
+#         if isinstance(x, torch.Tensor):
+#             return x
+#         return torch.from_numpy(np.asarray(x))
+
+#     def fmt_int(n: int) -> str:
+#         return f"{n:,}"
+
+#     ut = as_tensor(u_true)
+#     up = as_tensor(u_pred)
+
+#     # ---- optional time stride ----
+#     if stride_t is not None:
+#         ut = ut[..., ::stride_t]
+#         up = up[..., ::stride_t]
+
+#     # ---- ensure shapes match ----
+#     if ut.shape != up.shape:
+#         raise ValueError(f"Shape mismatch: true {tuple(ut.shape)} vs pred {tuple(up.shape)}")
+
+#     # ---- colormap ----
+#     cmap = ListedColormap(["#d9d9d9", "#ff0000", "#66d9ff", "#08306b"])  # TN, FP, FN, TP
+#     norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+
+#     legend_patches = [
+#         mpatches.Patch(color="#d9d9d9", label="TN (Correct dry)"),
+#         mpatches.Patch(color="#ff0000", label="FP (False alarm)"),
+#         mpatches.Patch(color="#66d9ff", label="FN (Missed flood)"),
+#         mpatches.Patch(color="#08306b", label="TP (Correct wet)"),
+#     ]
+
+#     # ---- compute & plot ----
+#     fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+#     if sample_idx is not None:
+#         if ut.ndim == 4:
+#             ut_s = ut[sample_idx]
+#             up_s = up[sample_idx]
+#         elif ut.ndim == 3:
+#             ut_s = ut
+#             up_s = up
+#         else:
+#             raise ValueError(f"Unsupported ndim for sample plot: {ut.ndim}")
+
+#         true_max = torch.max(ut_s, dim=-1).values
+#         pred_max = torch.max(up_s, dim=-1).values
+
+#         true_wet = true_max > inund_th
+#         pred_wet = pred_max > inund_th
+
+#         tn = (~true_wet) & (~pred_wet)
+#         fp = (~true_wet) & ( pred_wet)
+#         fn = ( true_wet) & (~pred_wet)
+#         tp = ( true_wet) & ( pred_wet)
+
+#         # map codes
+#         codes = torch.zeros_like(true_wet, dtype=torch.uint8)
+#         codes[fp] = 1
+#         codes[fn] = 2
+#         codes[tp] = 3
+#         img = codes.detach().cpu().numpy()
+
+#         ax.imshow(img.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+#         ax.set_title(f"{title_prefix}Ever-inundation confusion (sample={sample_idx}, th={inund_th} m)", fontsize=14)
+
+#         TN = int(tn.sum().item())
+#         FP = int(fp.sum().item())
+#         FN = int(fn.sum().item())
+#         TP = int(tp.sum().item())
+
+#         header = f"Confusion counts (sample={sample_idx}, th={inund_th} m)"
+#         total = TN + FP + FN + TP
+
+#     else:
+#         if ut.ndim != 4:
+#             raise ValueError("For across-samples plot, expected shape (N, nx, ny, nt).")
+
+#         true_max = torch.max(ut, dim=-1).values
+#         pred_max = torch.max(up, dim=-1).values
+
+#         true_wet = true_max > inund_th
+#         pred_wet = pred_max > inund_th
+
+#         tn = (~true_wet) & (~pred_wet)
+#         fp = (~true_wet) & ( pred_wet)
+#         fn = ( true_wet) & (~pred_wet)
+#         tp = ( true_wet) & ( pred_wet)
+
+#         TN = int(tn.sum().item())
+#         FP = int(fp.sum().item())
+#         FN = int(fn.sum().item())
+#         TP = int(tp.sum().item())
+
+#         header = f"Confusion counts (ALL samples + pixels, th={inund_th} m)"
+#         total = TN + FP + FN + TP
+
+#         # mode map
+#         counts = torch.stack([tn.sum(0), fp.sum(0), fn.sum(0), tp.sum(0)], dim=0)
+#         mode_map = torch.argmax(counts, dim=0).to(torch.uint8).detach().cpu().numpy()
+
+#         ax.imshow(mode_map.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+#         ax.set_title(f"{title_prefix}Across-samples confusion (MODE per pixel, th={inund_th} m)", fontsize=14)
+
+#     # ---- add legend (requested change) ----
+#     ax.legend(
+#         handles=legend_patches,
+#         loc="upper right",
+#         frameon=True,
+#         fontsize=10,
+#         title="Confusion classes",
+#         title_fontsize=10,
+#     )
+
+#     # --- conditional percentage printout (NOT over all pixels) ---
+#     cm = np.array([[TN, FP],
+#                    [FN, TP]], dtype=np.int64)
+
+#     def pct(num, den):
+#         return 100.0 * num / den if den > 0 else float("nan")
+
+#     true_wet = TP + FN
+#     true_dry = TN + FP
+#     pred_wet = TP + FP
+#     pred_dry = TN + FN
+#     total    = TP + TN + FP + FN
+
+#     wet_recall     = TP / true_wet if true_wet > 0 else float("nan")   # TPR / POD
+#     wet_precision  = TP / pred_wet if pred_wet > 0 else float("nan")   # PPV
+#     dry_recall     = TN / true_dry if true_dry > 0 else float("nan")   # TNR / Specificity
+#     fpr            = FP / true_dry if true_dry > 0 else float("nan")   # False alarm rate
+#     fnr            = FN / true_wet if true_wet > 0 else float("nan")   # Miss rate
+#     csi            = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else float("nan")  # IoU / CSI
+
+#     # F1 (wet class)
+#     f1 = (2 * wet_precision * wet_recall / (wet_precision + wet_recall)
+#           if np.isfinite(wet_precision) and np.isfinite(wet_recall) and (wet_precision + wet_recall) > 0
+#           else float("nan"))
+
+#     print("\n" + header)
+#     print("-" * len(header))
+#     print(f"TP (Correct wet)      : {fmt_int(TP)}")
+#     print(f"TN (Correct dry)      : {fmt_int(TN)}")
+#     print(f"FP (False alarm wet)  : {fmt_int(FP)}")
+#     print(f"FN (Missed wet)       : {fmt_int(FN)}")
+#     print(f"True wet  (TP+FN)     : {fmt_int(true_wet)}")
+#     print(f"True dry  (TN+FP)     : {fmt_int(true_dry)}")
+#     print(f"Pred wet  (TP+FP)     : {fmt_int(pred_wet)}")
+#     print(f"Pred dry  (TN+FN)     : {fmt_int(pred_dry)}")
+#     print(f"Total pixels          : {fmt_int(total)}")
+#     print()
+#     print(f"Wet Recall / POD  (TP/(TP+FN)) : {wet_recall:.4f}  ({pct(TP, true_wet):6.2f}%)")
+#     print(f"Wet Precision (TP/(TP+FP))    : {wet_precision:.4f}  ({pct(TP, pred_wet):6.2f}%)")
+#     print(f"Dry Recall / TNR  (TN/(TN+FP)) : {dry_recall:.4f}  ({pct(TN, true_dry):6.2f}%)")
+#     print(f"\nOveral performance\n")
+#     print(f"False Alarm Rate  (FP/(TN+FP)) : {fpr:.4f}  ({pct(FP, true_dry):6.2f}%)")
+#     print(f"Miss Rate         (FN/(TP+FN)) : {fnr:.4f}  ({pct(FN, true_wet):6.2f}%)")
+#     print(f"CSI / IoU         (TP/(TP+FP+FN)) : {csi:.4f}")
+#     print(f"F1-score (wet)     (2PR/(P+R))   : {f1:.4f}")
+
+#     return fig, ax
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap, BoundaryNorm, LightSource
+
 def plot_ever_inundation_confusion(
     u_true,
     u_pred,
-    sample_idx=None,        # if int -> plot that sample; if None -> plot across all samples (mode per pixel)
+    bed=None,                # NEW: bed topo tensor/array (nx,ny) or (N,nx,ny)
+    sample_idx=None,         # if int -> plot that sample; if None -> plot across all samples (mode per pixel)
     inund_th=0.01,
-    stride_t=None,          # e.g. 4 to use [..., ::4]; None = no striding
-    extent=None,            # e.g. [0, X_range, 0, Y_range]; None = pixel coords
+    stride_t=None,           # e.g. 4 to use [..., ::4]; None = no striding
+    extent=None,             # e.g. [0, X_range, 0, Y_range]; None = pixel coords
     title_prefix="",
     figsize=(8, 6),
+
+    # --- NEW hillshade controls ---
+    hillshade=True,
+    hill_azdeg=315,
+    hill_altdeg=45,
+    hill_vert_exag=2.5,
+    hill_dx=1.0,
+    hill_dy=1.0,
+    bed_alpha=1.0,
+    overlay_alpha=1.0,      # make overlay slightly transparent to see relief
 ):
     """
     Plot TN/FP/FN/TP confusion map for ever-inundated (max over time > inund_th),
-    and PRINT organized confusion counts + 2x2 matrix.
+    optionally overlaid on 3D-looking hillshaded bed topography.
 
     u_true/u_pred can be torch tensors or numpy arrays.
     Expected shapes:
       - single sample: (nx, ny, nt)
       - many samples:  (N, nx, ny, nt)
+
+    bed (optional):
+      - single bed: (nx, ny)
+      - per-sample: (N, nx, ny)
     """
 
     # ---- helpers ----
     def as_tensor(x):
+        if x is None:
+            return None
         if isinstance(x, torch.Tensor):
             return x
         return torch.from_numpy(np.asarray(x))
@@ -84,6 +289,7 @@ def plot_ever_inundation_confusion(
 
     ut = as_tensor(u_true)
     up = as_tensor(u_pred)
+    bd = as_tensor(bed)
 
     # ---- optional time stride ----
     if stride_t is not None:
@@ -108,6 +314,38 @@ def plot_ever_inundation_confusion(
     # ---- compute & plot ----
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
+    # =========================
+    # 0) Background: hillshade bed (optional)
+    # =========================
+    if bd is not None and hillshade:
+        # pick correct bed slice
+        if bd.ndim == 3:
+            if sample_idx is None:
+                # across-samples mode map: pick mean bed for visualization
+                bed_plot = bd.float().mean(dim=0)
+            else:
+                bed_plot = bd[sample_idx]
+        elif bd.ndim == 2:
+            bed_plot = bd
+        else:
+            raise ValueError(f"Unsupported bed ndim: {bd.ndim}. Expected (nx,ny) or (N,nx,ny).")
+
+        bed_np = bed_plot.detach().cpu().numpy()
+
+        # hillshade
+        ls = LightSource(azdeg=hill_azdeg, altdeg=hill_altdeg)
+        hill = ls.hillshade(bed_np, vert_exag=hill_vert_exag, dx=hill_dx, dy=hill_dy)  # [0..1]
+
+        # plot hillshade as grayscale relief
+        ax.imshow(
+            hill.T, extent=extent, origin="lower",
+            cmap="gist_yarg", vmin=0, vmax=1,
+            alpha=bed_alpha, interpolation="bilinear", zorder=1
+        )
+
+    # =========================
+    # 1) Confusion map overlay
+    # =========================
     if sample_idx is not None:
         if ut.ndim == 4:
             ut_s = ut[sample_idx]
@@ -136,7 +374,11 @@ def plot_ever_inundation_confusion(
         codes[tp] = 3
         img = codes.detach().cpu().numpy()
 
-        ax.imshow(img.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+        ax.imshow(
+            img.T, extent=extent, origin="lower",
+            cmap=cmap, norm=norm, interpolation="nearest",
+            alpha=overlay_alpha, zorder=2
+        )
         ax.set_title(f"{title_prefix}Ever-inundation confusion (sample={sample_idx}, th={inund_th} m)", fontsize=14)
 
         TN = int(tn.sum().item())
@@ -174,10 +416,14 @@ def plot_ever_inundation_confusion(
         counts = torch.stack([tn.sum(0), fp.sum(0), fn.sum(0), tp.sum(0)], dim=0)
         mode_map = torch.argmax(counts, dim=0).to(torch.uint8).detach().cpu().numpy()
 
-        ax.imshow(mode_map.T, extent=extent, origin="lower", cmap=cmap, norm=norm, interpolation="nearest")
+        ax.imshow(
+            mode_map.T, extent=extent, origin="lower",
+            cmap=cmap, norm=norm, interpolation="nearest",
+            alpha=overlay_alpha, zorder=2
+        )
         ax.set_title(f"{title_prefix}Across-samples confusion (MODE per pixel, th={inund_th} m)", fontsize=14)
 
-    # ---- add legend (requested change) ----
+    # ---- legend ----
     ax.legend(
         handles=legend_patches,
         loc="upper right",
@@ -187,27 +433,26 @@ def plot_ever_inundation_confusion(
         title_fontsize=10,
     )
 
-    # --- conditional percentage printout (NOT over all pixels) ---
+    # ---- metrics printout ----
     cm = np.array([[TN, FP],
                    [FN, TP]], dtype=np.int64)
 
     def pct(num, den):
         return 100.0 * num / den if den > 0 else float("nan")
 
-    true_wet = TP + FN
-    true_dry = TN + FP
-    pred_wet = TP + FP
-    pred_dry = TN + FN
-    total    = TP + TN + FP + FN
+    true_wet_ct = TP + FN
+    true_dry_ct = TN + FP
+    pred_wet_ct = TP + FP
+    pred_dry_ct = TN + FN
+    total_ct    = TP + TN + FP + FN
 
-    wet_recall     = TP / true_wet if true_wet > 0 else float("nan")   # TPR / POD
-    wet_precision  = TP / pred_wet if pred_wet > 0 else float("nan")   # PPV
-    dry_recall     = TN / true_dry if true_dry > 0 else float("nan")   # TNR / Specificity
-    fpr            = FP / true_dry if true_dry > 0 else float("nan")   # False alarm rate
-    fnr            = FN / true_wet if true_wet > 0 else float("nan")   # Miss rate
-    csi            = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else float("nan")  # IoU / CSI
+    wet_recall     = TP / true_wet_ct if true_wet_ct > 0 else float("nan")
+    wet_precision  = TP / pred_wet_ct if pred_wet_ct > 0 else float("nan")
+    dry_recall     = TN / true_dry_ct if true_dry_ct > 0 else float("nan")
+    fpr            = FP / true_dry_ct if true_dry_ct > 0 else float("nan")
+    fnr            = FN / true_wet_ct if true_wet_ct > 0 else float("nan")
+    csi            = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else float("nan")
 
-    # F1 (wet class)
     f1 = (2 * wet_precision * wet_recall / (wet_precision + wet_recall)
           if np.isfinite(wet_precision) and np.isfinite(wet_recall) and (wet_precision + wet_recall) > 0
           else float("nan"))
@@ -218,23 +463,22 @@ def plot_ever_inundation_confusion(
     print(f"TN (Correct dry)      : {fmt_int(TN)}")
     print(f"FP (False alarm wet)  : {fmt_int(FP)}")
     print(f"FN (Missed wet)       : {fmt_int(FN)}")
-    print(f"True wet  (TP+FN)     : {fmt_int(true_wet)}")
-    print(f"True dry  (TN+FP)     : {fmt_int(true_dry)}")
-    print(f"Pred wet  (TP+FP)     : {fmt_int(pred_wet)}")
-    print(f"Pred dry  (TN+FN)     : {fmt_int(pred_dry)}")
-    print(f"Total pixels          : {fmt_int(total)}")
+    print(f"True wet  (TP+FN)     : {fmt_int(true_wet_ct)}")
+    print(f"True dry  (TN+FP)     : {fmt_int(true_dry_ct)}")
+    print(f"Pred wet  (TP+FP)     : {fmt_int(pred_wet_ct)}")
+    print(f"Pred dry  (TN+FN)     : {fmt_int(pred_dry_ct)}")
+    print(f"Total pixels          : {fmt_int(total_ct)}")
     print()
-    print(f"Wet Recall / POD  (TP/(TP+FN)) : {wet_recall:.4f}  ({pct(TP, true_wet):6.2f}%)")
-    print(f"Wet Precision (TP/(TP+FP))    : {wet_precision:.4f}  ({pct(TP, pred_wet):6.2f}%)")
-    print(f"Dry Recall / TNR  (TN/(TN+FP)) : {dry_recall:.4f}  ({pct(TN, true_dry):6.2f}%)")
+    print(f"Wet Recall / POD  (TP/(TP+FN)) : {wet_recall:.4f}  ({pct(TP, true_wet_ct):6.2f}%)")
+    print(f"Wet Precision (TP/(TP+FP))    : {wet_precision:.4f}  ({pct(TP, pred_wet_ct):6.2f}%)")
+    print(f"Dry Recall / TNR  (TN/(TN+FP)) : {dry_recall:.4f}  ({pct(TN, true_dry_ct):6.2f}%)")
     print(f"\nOveral performance\n")
-    print(f"False Alarm Rate  (FP/(TN+FP)) : {fpr:.4f}  ({pct(FP, true_dry):6.2f}%)")
-    print(f"Miss Rate         (FN/(TP+FN)) : {fnr:.4f}  ({pct(FN, true_wet):6.2f}%)")
+    print(f"False Alarm Rate  (FP/(TN+FP)) : {fpr:.4f}  ({pct(FP, true_dry_ct):6.2f}%)")
+    print(f"Miss Rate         (FN/(TP+FN)) : {fnr:.4f}  ({pct(FN, true_wet_ct):6.2f}%)")
     print(f"CSI / IoU         (TP/(TP+FP+FN)) : {csi:.4f}")
     print(f"F1-score (wet)     (2PR/(P+R))   : {f1:.4f}")
 
     return fig, ax
-
 
 
 def get_checkpoint_path(case, nx, ny, t_in, t_out, tag, op_type, train_size, ig_enabled, SAVED_MODEL_PATH, if_best=False):
