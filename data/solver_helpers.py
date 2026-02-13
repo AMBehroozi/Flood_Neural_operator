@@ -7,6 +7,202 @@ import torch
 from torch.utils.data.distributed import DistributedSampler
 import torch.nn.functional as F
 import torch.nn as nn
+import matplotlib.pyplot as plt
+
+
+
+# ==========================================
+# Method 1: Rate of Change Analysis
+# ==========================================
+def check_steady_state_rate_of_change(depth_all, time_array, threshold=1e-4):
+    """
+    Check steady state by analyzing rate of change over time
+    """
+    # Calculate time differences
+    dt = np.diff(time_array)
+    
+    # Calculate rate of change for each node
+    depth_rate = np.diff(depth_all, axis=0) / dt[:, np.newaxis]
+    
+    # Calculate global rate of change (RMS across all nodes)
+    global_rate = np.sqrt(np.mean(depth_rate**2, axis=1))
+    
+    # Check if rate is below threshold
+    steady_state_reached = global_rate[-10:].mean() < threshold
+    
+    return global_rate, steady_state_reached
+
+# ==========================================
+# Method 2: Maximum Depth Change Between Timesteps
+# ==========================================
+def check_steady_state_max_change(depth_all, time_array, threshold=0.001):
+    """
+    Check steady state by maximum depth change between consecutive timesteps
+    """
+    # Maximum absolute change at any node between timesteps
+    max_changes = np.max(np.abs(np.diff(depth_all, axis=0)), axis=1)
+    
+    # Check if recent changes are below threshold
+    steady_state_reached = max_changes[-10:].mean() < threshold
+    
+    return max_changes, steady_state_reached
+
+# ==========================================
+# Method 3: Total Volume Conservation
+# ==========================================
+def check_steady_state_volume(depth_all, volumes, x, y, time_array):
+    """
+    Check steady state by tracking total water volume over time
+    """
+    # Calculate area of each triangle
+    x_tri = x[volumes]
+    y_tri = y[volumes]
+    areas = 0.5 * np.abs(
+        (x_tri[:, 1] - x_tri[:, 0]) * (y_tri[:, 2] - y_tri[:, 0]) -
+        (x_tri[:, 2] - x_tri[:, 0]) * (y_tri[:, 1] - y_tri[:, 0])
+    )
+    
+    # Calculate total volume at each timestep
+    total_volumes = []
+    for i in range(len(time_array)):
+        # Average depth in each triangle
+        avg_depth_per_triangle = depth_all[i, volumes].mean(axis=1)
+        total_vol = np.sum(avg_depth_per_triangle * areas)
+        total_volumes.append(total_vol)
+    
+    total_volumes = np.array(total_volumes)
+    
+    # Rate of volume change
+    volume_rate = np.abs(np.diff(total_volumes))
+    
+    return total_volumes, volume_rate
+
+# ==========================================
+# Method 4: Statistical Convergence
+# ==========================================
+def check_steady_state_statistics(depth_all, window=50, threshold=0.01):
+    """
+    Check if statistical properties (mean, std) stabilize
+    """
+    n_timesteps = depth_all.shape[0]
+    
+    mean_depths = np.mean(depth_all, axis=1)
+    std_depths = np.std(depth_all, axis=1)
+    
+    # Check if mean and std are stable in recent window
+    if n_timesteps > window:
+        recent_mean_change = np.std(mean_depths[-window:]) / np.mean(mean_depths[-window:])
+        recent_std_change = np.std(std_depths[-window:]) / np.mean(std_depths[-window:])
+        
+        steady_state_reached = (recent_mean_change < threshold) and (recent_std_change < threshold)
+    else:
+        steady_state_reached = False
+    
+    return mean_depths, std_depths, steady_state_reached
+
+
+
+def loading_data(sww_file, min_depth_threshold=0.01):
+    """
+    Loads ANUGA .sww file, calculates water depth, removes NaNs, 
+    and applies a wet/dry threshold.
+    """
+    print(f"Loading data from: {sww_file}")
+    ds = Dataset(sww_file, 'r')
+
+    # 1. Extract static mesh data
+    x = ds.variables['x'][:]
+    y = ds.variables['y'][:]
+    volumes = ds.variables['volumes'][:]     # Triangle connectivity
+    elevation = ds.variables['elevation'][:] # Shape: (num_points,)
+
+    # 2. Extract dynamic data (Stage)
+    # Shape: (time, num_points)
+    stage_all = ds.variables['stage'][:] 
+    time_array = ds.variables['time'][:]
+    
+    ds.close() # Close file after loading data into memory
+
+    # 3. Calculate Depth
+    # NumPy broadcasts (time, points) - (points,) automatically.
+    depth_all = stage_all - elevation
+
+    # 4. Clean and Threshold
+    # Step A: Clean existing NaNs (Method 1: Replace NaN with 0.0)
+    # This fixes the "nan, nan" min/max issue
+    depth_all = np.nan_to_num(depth_all, nan=0.0)
+
+    # Step B: Enforce Threshold (Hard reset shallow water to 0.0)
+    depth_all[depth_all < min_depth_threshold] = 0.0
+
+    # 5. Verification Prints
+    print(f"Depth calculated with threshold {min_depth_threshold}m.")
+    print("Shape of depth_all:", depth_all.shape)
+    print("Final Min Depth:", depth_all.min())
+    print("Final Max Depth:", depth_all.max())
+    return x, y, volumes, elevation, depth_all, time_array
+
+
+
+def get_sww_mesh_and_states(sww_path, last_index=-1, dry_threshold=0.025):
+    """
+    Reads SWW file and enforces a minimum depth threshold.
+    Cells with depth < dry_threshold are forced to stage = elevation and zero momentum.
+    """
+    if not os.path.exists(sww_path):
+        raise FileNotFoundError(f"SWW file not found at: {sww_path}")
+
+    nc = Dataset(sww_path, 'r')
+
+    # 1. EXTRACT VERTICES
+    v_x = nc.variables['x'][:]
+    v_y = nc.variables['y'][:]
+    vertices = np.column_stack((v_x, v_y))
+    
+    # 2. EXTRACT CONNECTIVITY
+    triangles = nc.variables['volumes'][:]
+    
+    # 3. EXTRACT STATES
+    stage = nc.variables['stage'][last_index, :].copy() # Use .copy() to allow modification
+    xmom  = nc.variables['xmomentum'][last_index, :].copy()
+    ymom  = nc.variables['ymomentum'][last_index, :].copy()
+    
+    if nc.variables['elevation'].ndim == 2:
+        elev = nc.variables['elevation'][last_index, :]
+    else:
+        elev = nc.variables['elevation'][:]
+    
+    # 4. ENFORCE DRY THRESHOLD
+    # Calculate depth: h = w - z
+    depth = stage - elev
+    
+    # Create a mask for dry cells
+    dry_indices = depth < dry_threshold
+    
+    # Force stage to match elevation (depth becomes 0.0)
+    stage[dry_indices] = elev[dry_indices]
+    
+    # Force momentum to zero in dry cells to prevent "phantom" flows
+    xmom[dry_indices] = 0.0
+    ymom[dry_indices] = 0.0
+
+    time_last = nc.variables['time'][last_index]
+    nc.close()
+
+    print(f"✓ Loaded states. Forced {np.sum(dry_indices)} cells to dry state (threshold: {dry_threshold}m)")
+
+    return {
+        'vertices': vertices,
+        'triangles': triangles,
+        'stage': stage,
+        'elevation': elev,
+        'xmomentum': xmom,
+        'ymomentum': ymom,
+        'time_last': time_last
+    }
+
+
+
 
 
 def _smoothstep(t):

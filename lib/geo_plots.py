@@ -11,6 +11,169 @@ import anuga
 import os
 
 
+def show_nan_locations_in_asc(
+    asc_path: str,
+    title: str = "NaN / NODATA Locations in ASC File",
+    nan_color: str = 'red',
+    valid_color: str = 'gray',
+    figsize: tuple = (10, 8),
+    show_coords: bool = True
+):
+    """
+    Loads ASC file and shows a map of NaN/NODATA cells.
+    - Red = NaN / NODATA
+    - Gray = valid elevation
+    """
+    try:
+        # ─── Read header ────────────────────────────────────────────────
+        header = {}
+        with open(asc_path, 'r') as f:
+            for _ in range(6):
+                line = f.readline().strip()
+                if line:
+                    key, val = line.split(maxsplit=1)
+                    header[key.lower()] = float(val) if '.' in val else int(val)
+
+        ncols   = int(header['ncols'])
+        nrows   = int(header['nrows'])
+        xll     = header['xllcorner']
+        yll     = header['yllcorner']
+        cellsize = header['cellsize']
+        nodata   = header.get('nodata_value', -9999)
+
+        # ─── Load data ──────────────────────────────────────────────────
+        data = np.loadtxt(asc_path, skiprows=6)
+
+        # Mark NODATA as NaN
+        data[data == nodata] = np.nan
+
+        # Mask array: True = valid, False = NaN
+        valid_mask = ~np.isnan(data)
+
+        # ─── Statistics ─────────────────────────────────────────────────
+        total_cells = data.size
+        nan_count   = np.sum(np.isnan(data))
+        print(f"\nFile: {asc_path}")
+        print(f"Grid: {nrows} × {ncols} = {total_cells:,} cells")
+        print(f"NaN/NODATA cells: {nan_count:,} ({nan_count/total_cells*100:.2f}%)")
+        print(f"Valid cells: {np.sum(valid_mask):,}")
+
+        if nan_count == 0:
+            print("→ No NaN / NODATA values found.")
+            return
+
+        # ─── Plot mask ──────────────────────────────────────────────────
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Show valid cells in gray, NaN in red
+        ax.imshow(~valid_mask, cmap=plt.cm.colors.ListedColormap([nan_color, valid_color]),
+                  origin='upper', extent=[xll, xll + ncols*cellsize, yll, yll + nrows*cellsize])
+
+        ax.set_title(f"{title}\nRed = NaN/NODATA ({nan_count:,} cells)")
+        ax.set_xlabel('Easting (m)')
+        ax.set_ylabel('Northing (m)')
+        ax.grid(False)
+
+        # Optional: print coordinates of first few NaN cells
+        if show_coords:
+            nan_rows, nan_cols = np.where(np.isnan(data))
+            print("\nFirst 10 NaN cell locations (row, col → map coords):")
+            for i in range(min(10, len(nan_rows))):
+                r, c = nan_rows[i], nan_cols[i]
+                x = xll + c * cellsize + cellsize/2
+                y = yll + (nrows - 1 - r) * cellsize + cellsize/2
+                print(f"  row {r:4d}, col {c:4d} → x={x:.2f}, y={y:.2f}")
+
+        plt.tight_layout()
+        plt.show()
+
+    except Exception as e:
+        print(f"Error reading {asc_path}: {e}")
+
+
+
+
+def check_asc_for_nan(
+    asc_path: str,
+    print_sample: bool = True,
+    print_nan_locations: bool = False
+):
+    """
+    Loads an ASC file and checks for NaN values in the elevation grid.
+    
+    Parameters:
+    - asc_path: path to the .asc file
+    - print_sample: show a few values from the grid
+    - print_nan_locations: print coordinates of first few NaN cells (if any)
+    """
+    try:
+        # ─── Read header (first 6 lines) ────────────────────────────────────────
+        header = {}
+        with open(asc_path, 'r') as f:
+            for _ in range(6):
+                line = f.readline().strip()
+                if line:
+                    key, val = line.split(maxsplit=1)
+                    header[key.lower()] = float(val) if '.' in val else int(val)
+
+        required = ['ncols', 'nrows', 'xllcorner', 'yllcorner', 'cellsize']
+        for k in required:
+            if k not in header:
+                raise ValueError(f"Missing header key: {k}")
+
+        ncols   = int(header['ncols'])
+        nrows   = int(header['nrows'])
+        cellsize = header['cellsize']
+        nodata   = header.get('nodata_value', -9999)
+
+        # ─── Load elevation data ────────────────────────────────────────────────
+        data = np.loadtxt(asc_path, skiprows=6)
+
+        # Replace NODATA value with NaN (so we can detect it properly)
+        data = np.where(data == nodata, np.nan, data)
+
+        # ─── Statistics ─────────────────────────────────────────────────────────
+        total_cells = data.size
+        nan_count   = np.sum(np.isnan(data))
+        finite_count = np.sum(np.isfinite(data))
+        valid_min   = np.nanmin(data) if finite_count > 0 else np.nan
+        valid_max   = np.nanmax(data) if finite_count > 0 else np.nan
+        valid_mean  = np.nanmean(data) if finite_count > 0 else np.nan
+
+        print(f"\nASC file: {asc_path}")
+        print(f"Grid size: {nrows} rows × {ncols} cols = {total_cells:,} cells")
+        print(f"Cell size: {cellsize} m")
+        print(f"NODATA value in header: {nodata}")
+        print(f"NaN count after loading: {nan_count:,} / {total_cells:,} ({nan_count/total_cells*100:.2f}%)")
+        print(f"Valid (finite) cells: {finite_count:,}")
+        if finite_count > 0:
+            print(f"Valid elevation range: {valid_min:.3f} – {valid_max:.3f} m")
+            print(f"Valid mean elevation: {valid_mean:.3f} m")
+
+        # ─── Optional: show sample values ───────────────────────────────────────
+        if print_sample and total_cells > 0:
+            print("\nSample of first few values (top-left corner):")
+            print(data[:5, :5])  # first 5×5 block
+
+        # ─── Optional: show locations of NaN cells ──────────────────────────────
+        if print_nan_locations and nan_count > 0:
+            print("\nFirst few NaN cell locations (row, col):")
+            nan_rows, nan_cols = np.where(np.isnan(data))
+            for i in range(min(10, len(nan_rows))):
+                r, c = nan_rows[i], nan_cols[i]
+                x = header['xllcorner'] + c * cellsize
+                y = header['yllcorner'] + (nrows - 1 - r) * cellsize  # y decreases downward
+                print(f"  row {r}, col {c} → (x={x:.2f}, y={y:.2f})")
+
+        if nan_count == 0:
+            print("→ No NaN values detected in the grid.")
+
+    except Exception as e:
+        print(f"Error reading {asc_path}: {e}")
+
+
+
+
 def plot_mesh(
     domain,
     dplotter,

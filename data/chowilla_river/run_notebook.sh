@@ -25,3 +25,4 @@ INPUT_NOTEBOOK="chowilla_flooding_simulation.ipynb"
 OUTPUT_NOTEBOOK="../../slurm_log/chowilla_flooding_simulation_out.ipynb"
 
 papermill "$INPUT_NOTEBOOK" "$OUTPUT_NOTEBOOK"
+mpirun -np 20 --oversubscribe python reaching_steady_state_parallel.py
