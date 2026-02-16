@@ -5,7 +5,7 @@
 #SBATCH --mem=80GB
 #SBATCH --gpus=4
 #SBATCH --time=24:00:00
-#SBATCH --job-name='dam_break_stage1_UQ_C'
+#SBATCH --job-name='chowilla_river_config_stage1'
 #SBATCH --account=cxs1024_cr_default
 #SBATCH --partition=standard
 #SBATCH --output=slurm_log/slurm-%j.out

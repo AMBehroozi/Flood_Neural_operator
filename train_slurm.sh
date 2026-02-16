@@ -3,10 +3,9 @@
 #SBATCH --ntasks=4
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80GB
-#SBATCH -C v100s
 #SBATCH --gpus=4
 #SBATCH --time=24:00:00
-#SBATCH --job-name='dam_break_stage1_UQ_C'
+#SBATCH --job-name='test_mag_residual_model5_Deep_stage1_45'
 #SBATCH --partition=mgc-mri
 #SBATCH --account=cxs1024_mri
 #SBATCH --output=slurm_log/slurm-%j.out

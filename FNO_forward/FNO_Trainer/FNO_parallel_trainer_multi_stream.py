@@ -329,6 +329,7 @@ def train_model(rank, world_size,
                 # --- GLOBAL PASS ---
                 optimizer.zero_grad(set_to_none=True)
                 U_pred = model(batch_forcing, batch_u0, batch_topo_train)
+
                 # U_pred[U_pred < DRY_THRESHOLD] = 0
                 
                 batch_u_out_lr = coarsen_spatial_tensor(batch_u_out_hr, N=f, mode=coarsen_mode)
@@ -751,11 +752,18 @@ def main(
 if __name__ == "__main__":
     
     # 1. Initialization & Config Loading
-    
+    # chowilla_river
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage1.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage2.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage3.yml')    
+
     # Dam break
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage1_UQ.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage1_UQ.yml')    
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage2.yml')    
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage3.yml')    
+
+
+
 
     # flooding
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/flooding/flooding_config_stage1.yml')
