@@ -419,6 +419,8 @@ def plot_inundation_extent_time(
 
 
 
+import torch
+
 def evaluate_flood_metrics(
     Depth_True,
     Depth_Pred,
@@ -442,6 +444,18 @@ def evaluate_flood_metrics(
     # ------------------------------------------
     relrmse_batch = []
     nse_batch = []
+
+    # NEW: depth-stratified static metrics
+    relrmse_shallow_batch = []  # h < 0.5
+    nse_shallow_batch = []
+    relrmse_deep_batch = []     # h >= 0.5
+    nse_deep_batch = []
+
+    # NEW: static binary metrics (aggregated over all space-time per sample)
+    pod_batch = []
+    far_batch = []
+    csi_batch = []
+
     peak_val_err_batch = []
     peak_time_err1_batch = []
     peak_time_err2_batch = []
@@ -471,6 +485,60 @@ def evaluate_flood_metrics(
 
         nse = 1 - torch.sum(diff**2) / (torch.sum((O - mean_O)**2) + eps)
         nse_batch.append(nse)
+
+        # --------------------------------------
+        # NEW: Depth-stratified static relRMSE & NSE
+        # --------------------------------------
+        shallow_mask = O < 0.5
+        deep_mask = O >= 0.5
+
+        # Shallow
+        n_sh = shallow_mask.sum()
+        if n_sh > 0:
+            O_sh = O[shallow_mask]
+            P_sh = P[shallow_mask]
+            diff_sh = O_sh - P_sh
+
+            rmse_sh = torch.sqrt(torch.mean(diff_sh**2))
+            mean_O_sh = torch.mean(O_sh)
+            relrmse_shallow_batch.append(rmse_sh / (mean_O_sh + eps))
+
+            nse_sh = 1 - torch.sum(diff_sh**2) / (torch.sum((O_sh - mean_O_sh)**2) + eps)
+            nse_shallow_batch.append(nse_sh)
+        else:
+            relrmse_shallow_batch.append(torch.tensor(float("nan"), device=Depth_True.device))
+            nse_shallow_batch.append(torch.tensor(float("nan"), device=Depth_True.device))
+
+        # Deep
+        n_dp = deep_mask.sum()
+        if n_dp > 0:
+            O_dp = O[deep_mask]
+            P_dp = P[deep_mask]
+            diff_dp = O_dp - P_dp
+
+            rmse_dp = torch.sqrt(torch.mean(diff_dp**2))
+            mean_O_dp = torch.mean(O_dp)
+            relrmse_deep_batch.append(rmse_dp / (mean_O_dp + eps))
+
+            nse_dp = 1 - torch.sum(diff_dp**2) / (torch.sum((O_dp - mean_O_dp)**2) + eps)
+            nse_deep_batch.append(nse_dp)
+        else:
+            relrmse_deep_batch.append(torch.tensor(float("nan"), device=Depth_True.device))
+            nse_deep_batch.append(torch.tensor(float("nan"), device=Depth_True.device))
+
+        # --------------------------------------
+        # NEW: Static binary inundation metrics (aggregate over all time)
+        # --------------------------------------
+        wet_O_all = O > wet_threshold
+        wet_P_all = P > wet_threshold
+
+        TP_all = torch.sum(wet_O_all & wet_P_all).float()
+        FP_all = torch.sum(~wet_O_all & wet_P_all).float()
+        FN_all = torch.sum(wet_O_all & ~wet_P_all).float()
+
+        pod_batch.append(TP_all / (TP_all + FN_all + eps))
+        far_batch.append(FP_all / (TP_all + FP_all + eps))
+        csi_batch.append(TP_all / (TP_all + FP_all + FN_all + eps))
 
         # --------------------------------------
         # Dynamic metrics over time
@@ -550,9 +618,30 @@ def evaluate_flood_metrics(
     # ------------------------------------------
     relrmse_batch = torch.stack(relrmse_batch)
     nse_batch = torch.stack(nse_batch)
+
+    # NEW
+    relrmse_shallow_batch = torch.stack(relrmse_shallow_batch)
+    nse_shallow_batch = torch.stack(nse_shallow_batch)
+    relrmse_deep_batch = torch.stack(relrmse_deep_batch)
+    nse_deep_batch = torch.stack(nse_deep_batch)
+
+    # NEW: static binary
+    pod_batch = torch.stack(pod_batch)
+    far_batch = torch.stack(far_batch)
+    csi_batch = torch.stack(csi_batch)
+
     peak_val_err_batch = torch.stack(peak_val_err_batch)
     peak_time_err1_batch = torch.stack(peak_time_err1_batch)
     peak_time_err2_batch = torch.stack(peak_time_err2_batch)
+
+    # Helpers to ignore NaNs (in case a sample has no shallow/deep pixels)
+    def nanmean(x):
+        mask = ~torch.isnan(x)
+        return x[mask].mean().item() if mask.any() else float("nan")
+
+    def nanstd(x):
+        mask = ~torch.isnan(x)
+        return x[mask].std().item() if mask.any() else float("nan")
 
     # ------------------------------------------
     # Static (mean ± std over batch)
@@ -563,6 +652,26 @@ def evaluate_flood_metrics(
 
         "NSE_mean": nse_batch.mean().item(),
         "NSE_std": nse_batch.std().item(),
+
+        # NEW: shallow (<0.5m)
+        "relRMSE_shallow_mean": nanmean(relrmse_shallow_batch),
+        "relRMSE_shallow_std": nanstd(relrmse_shallow_batch),
+        "NSE_shallow_mean": nanmean(nse_shallow_batch),
+        "NSE_shallow_std": nanstd(nse_shallow_batch),
+
+        # NEW: deep (>=0.5m)
+        "relRMSE_deep_mean": nanmean(relrmse_deep_batch),
+        "relRMSE_deep_std": nanstd(relrmse_deep_batch),
+        "NSE_deep_mean": nanmean(nse_deep_batch),
+        "NSE_deep_std": nanstd(nse_deep_batch),
+
+        # NEW: static binary inundation metrics
+        "POD_mean": pod_batch.mean().item(),
+        "POD_std": pod_batch.std().item(),
+        "FAR_mean": far_batch.mean().item(),
+        "FAR_std": far_batch.std().item(),
+        "CSI_mean": csi_batch.mean().item(),
+        "CSI_std": csi_batch.std().item(),
 
         "relPeakValErr_mean": peak_val_err_batch.mean().item(),
         "relPeakValErr_std": peak_val_err_batch.std().item(),
@@ -589,6 +698,8 @@ def evaluate_flood_metrics(
         "static": static_metrics,
         "dynamic": dynamic_metrics
     }
+
+
 
 
 def inundation_extent_timeseries(

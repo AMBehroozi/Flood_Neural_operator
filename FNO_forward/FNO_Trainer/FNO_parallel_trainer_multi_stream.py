@@ -346,7 +346,7 @@ def train_model(rank, world_size,
                 # --- NEW: GENERATE GLOBAL BATHTUB BASELINE ---
                 # This is the "Identity" for Residual Learning
                 with torch.set_grad_enabled(training_mode == 'Stage3'):
-                    u_bt_global = reconstructor(U_pred)
+                    u_bt_global = reconstructor(U_pred, batch_topo_train)
 
                 # --- MAGNIFIER PASS (Stage 2 & Stage 3) ---
                 # Detach if Stage 2 to save memory; Keep graph for Stage 3
@@ -378,9 +378,11 @@ def train_model(rank, world_size,
                         p_target = target_pad[:, i_s*f : i_s*f + N*f, j_s*f : j_s*f + N*f, :].unsqueeze(1)
                         
                         is_wet = p_target.max() >= DRY_THRESHOLD
-                        is_shallow_boundary = p_target.min() < SHALLOW_THRESHOLD
+                        # is_shallow_boundary = p_target.min() < SHALLOW_THRESHOLD
 
-                        if not (is_wet and is_shallow_boundary):
+                        # if not (is_wet and is_shallow_boundary):
+                        if not is_wet:
+
                             continue 
 
                         # if p_target.max() < DRY_THRESHOLD: continue 
@@ -462,7 +464,7 @@ def train_model(rank, world_size,
                         v_topo = batch_data[2]
                         # v_topo = batch_topo_train = (batch_data[2] - GLOBAL_TOPO_MEAN) / GLOBAL_TOPO_STD
                     else:
-                        v_topo = topo.expand(bs, -1, -1)
+                        v_topo = topo.expand(bs_v, -1, -1)
 
 
                     # Global Validation
@@ -473,7 +475,7 @@ def train_model(rank, world_size,
                     if training_mode == 'Stage1': continue
 
                     # --- NEW: Generate Global Bathtub for Validation ---
-                    v_u_bt_global = reconstructor(v_coarse_pred)
+                    v_u_bt_global = reconstructor(v_coarse_pred, v_topo)
 
                     # Magnifier Validation Prep
                     v_u_pad = F.pad(v_coarse_pred.permute(0, 3, 1, 2), (N,N,N,N), mode='replicate').permute(0,2,3,1)
@@ -711,7 +713,6 @@ def main(
 
     magnifier_fn = magnifier_fn.to(device)
 
-
     # Only needed if IG is enabled (still safe to create)
     ss = 2 if enable_ig_loss else 1
     awl_fn = AutomaticWeightedLoss(ss)
@@ -753,13 +754,13 @@ if __name__ == "__main__":
     
     # 1. Initialization & Config Loading
     # chowilla_river
-    cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage1.yml')    
+    # cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage1.yml')    
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage2.yml')    
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/chowilla_river/chowilla_river_config_stage3.yml')    
 
     # Dam break
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage1_UQ.yml')    
-    # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage2.yml')    
+    cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage2.yml')    
     # cfg = load_config('FNO_forward/FNO_Trainer/configs/dam_break/dam_break_config_stage3.yml')    
 
 

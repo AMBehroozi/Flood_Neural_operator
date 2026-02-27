@@ -12,12 +12,12 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'chowilla_river'
-  tag: 'test_mag_residual_model5_Deep_stage1'
+  tag: 'test_mag_residual_model5_Deep_stage1_45'
   training_mode: 'Stage1' # Options: Stage1, Stage2, Stage3
   UQ_mode: False
   enable_ig_loss: false
   save_results: True
-  train_size: 300
+  train_size: 150
   eval_size: 150
   seed: 42
 
@@ -34,13 +34,13 @@ model:
   operator_type: 'FNO' # Options: CNO, FNO, WNO, DeepONet
   nx: 328
   ny: 164
-  total_steps: 90
+  total_steps: 45
   t_in: 1
   magnification_factor: 4
   magnifier_window_size: 5
   WET_BATCH_QUOTA: 20
   accumulation_steps: 2
-  step_time: 1
+  step_time: 2
   coarsen_mode: 'area'
 
 # Architecture-Specific Settings

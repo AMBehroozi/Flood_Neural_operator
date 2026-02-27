@@ -5,7 +5,7 @@
 #SBATCH --mem=80GB
 #SBATCH --gpus=4
 #SBATCH --time=24:00:00
-#SBATCH --job-name='test_mag_residual_model5_Deep_stage1_45'
+#SBATCH --job-name='dam_break_stage2_N1'
 #SBATCH --partition=mgc-mri
 #SBATCH --account=cxs1024_mri
 #SBATCH --output=slurm_log/slurm-%j.out

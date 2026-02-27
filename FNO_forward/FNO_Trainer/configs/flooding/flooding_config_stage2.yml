@@ -11,7 +11,7 @@ paths:
 # Experiment Metadata
 experiment:
   case: 'Hurricane_Matthew'
-  tag: 'test_mag_residual_model5_Deep_stage2_S'
+  tag: 'test_mag_residual_model5_Deep_stage2_N1'
   training_mode: 'Stage2' # Options: Stage1, Stage2, Stage3
   UQ_mode: False
   enable_ig_loss: false
@@ -36,7 +36,7 @@ model:
   total_steps: 89
   t_in: 1
   magnification_factor: 4
-  magnifier_window_size: 5
+  magnifier_window_size: 1
   WET_BATCH_QUOTA: 20
   accumulation_steps: 2
 
