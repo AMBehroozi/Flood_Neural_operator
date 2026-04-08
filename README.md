@@ -112,7 +112,7 @@ These cases were selected to represent distinct flood-generation mechanisms and 
 
 
 <p align="center">
-  <img src="figs/animation.gif" width="800"/>
+  <img src="figs/animation.gif" width="1000"/>
 </p>
 
 <p align="center">
