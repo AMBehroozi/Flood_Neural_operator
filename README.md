@@ -27,9 +27,7 @@ The framework is designed to preserve large-domain hydraulic consistency while r
   <img src="figs/Global_model-1.png" width="800"/>
 </p>
 
-<p align="center">
-  <strong>Figure 1:</strong> Overview of the multi-resolution flood inundation framework.
-</p>
+**Figure 1:** Overview of the Multi-Resolution Flood Mapping Framework. The pipeline consists of two primary stages: (1) A **coarse-resolution FNO** that predicts coarse-resolution temporal flood maps across the entire domain based on spatiotemporal gauge forcing and bed topography; and (2) a localized **Feature-wise Linear Modulation based Residual Convolutional Neural Operator (FiLM-RCNO)** in Magnifier Mode. The Magnifier operates on specific $N \times N$ windows extracted from the coarse resolution prediction, utilizing high-resolution topographic data and a hydrostatic baseline to produce final **Fine-Resolution Temporal Flood Maps** via hydraulic residual correction.
 
 ### Stage 1: Global Wave Propagation with FNO
 
@@ -57,9 +55,8 @@ This baseline provides a physically plausible starting point, while the neural m
   <img src="figs/magnifier-1.png" width="800"/>
 </p>
 
-<p align="center">
-  <strong>Figure 2:</strong> Architecture of the FiLM-RCNO Magnifier model.
-</p>
+**Figure 2:** **Architecture of the FiLM-RCNO Magnifier Model.**
+The Magnifier performs localized refinement on an $N \times N$ window of coarse-resolution flood predictions produced by the Fourier Neural Operator. The model ingests the high-resolution digital elevation model (DEM), the coarse flood depth, and a physically anchored hydrostatic bathtub baseline. A Feature-wise Linear Modulation (FiLM) conditioned residual convolutional neural operator predicts a hydraulic residual correction, which is added to the bathtub baseline to produce the final super-resolution flood depth for each local window.
 
 The magnifier operates on overlapping local patches for memory-efficient high-resolution inference. Each patch typically uses three main information channels:
 
@@ -112,9 +109,15 @@ These cases were selected to represent distinct flood-generation mechanisms and 
 
 ## Flooding Animation
 
-![Hurricane-driven fluvial flooding event along the Neuse River](figs/animation.gif)
 
-*Animation: Hurricane-driven fluvial flooding event along the Neuse River.*
+
+<p align="center">
+  <img src="figs/animation.gif" width="800"/>
+</p>
+
+<p align="center">
+  <strong>Hurricane-driven fluvial flooding event along the Neuse River.</strong>
+</p>
 
 ---
 
