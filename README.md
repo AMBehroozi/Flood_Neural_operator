@@ -186,16 +186,3 @@ This repository is intended for researchers and practitioners working in:
 - and real-time or ensemble-based flood forecasting.
 
 ---
-
-## Citation
-
-If you use this repository in your work, please cite the corresponding paper once it is published.
-
-```bibtex
-@article{placeholder2026floodno,
-  title   = {Physically Anchored Multi-Resolution Neural Operator Framework for Flood Inundation Prediction},
-  author  = {Authors},
-  journal = {Hydrology and Earth System Sciences},
-  year    = {2026},
-  note    = {Under review}
-}
