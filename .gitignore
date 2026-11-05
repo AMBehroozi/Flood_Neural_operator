@@ -1,0 +1,7 @@
+experiments/saved_model/*.pth
+
+# Ignore dataset files
+datasets/**/*.pt
+
+# Ignore saved model weights
+experiments/saved_model/*.pth

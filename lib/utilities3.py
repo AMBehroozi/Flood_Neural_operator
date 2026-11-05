@@ -15,7 +15,7 @@ sys.path.append("../../")
 sys.path.append("../")
 sys.path.append("./")
 
-from lib.batchJacobian import batchJacobian_PDE
+# from lib.batchJacobian import batchJacobian_PDE
 import pickle
 import random
 from torch.utils.data import TensorDataset, random_split, DataLoader
