@@ -134,6 +134,25 @@ This codebase provides the core implementation needed to train and evaluate the 
 
 ---
 
+## Datasets and Pretrained Models
+
+The simulation datasets and pretrained model checkpoints associated with the paper **"Physically Anchored Multi-Resolution Neural Operator Framework for Flood Inundation Prediction"** are hosted separately on Zenodo due to their large file sizes.
+
+**Zenodo repository:** [Datasets and Trained Models](https://zenodo.org/deposit/23988604)
+
+The repository contains two archives:
+
+- **`datasets.zip`** — Simulation datasets for the Neuse River flooding, Fall River Lake dam-break, and Chowilla floodplain case studies. Each dataset includes bed topography, input features, and corresponding simulation solutions stored as PyTorch tensors (`.pt`).
+- **`experiments.zip`** — Pretrained neural network model checkpoints (`.pth`) used in the experiments.
+
+Both archives preserve the original directory structure and filenames. To use the provided datasets and checkpoints, download and extract both archives into the root directory of this GitHub repository.
+
+The datasets and pretrained models are provided to support reproducibility and further research on flood inundation prediction using neural operators.
+
+---
+
+
+
 ## Repository Structure
 
 - `models/`  
