@@ -418,6 +418,69 @@ def plot_inundation_extent_time(
 
 
 
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def plot_metrics(metrics, figsize=(15, 4)):
+
+    groups = {
+        "Relative RMSE": [
+            "relRMSE",
+            "relRMSE_shallow",
+            "relRMSE_deep",
+        ],
+        "NSE": [
+            "NSE",
+            "NSE_shallow",
+            "NSE_deep",
+        ],
+        "Flood Detection": [
+            "POD",
+            "FAR",
+            "CSI",
+        ],
+    }
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    for ax, (title, names) in zip(axes, groups.items()):
+
+        means = [metrics[f"{name}_mean"] for name in names]
+        stds = [metrics[f"{name}_std"] for name in names]
+
+        x = np.arange(len(names))
+
+        ax.bar(
+            x,
+            means,
+            yerr=stds,
+            capsize=5,
+            alpha=0.8,
+        )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(names, rotation=25, ha="right")
+        ax.set_title(title)
+        ax.set_ylabel("Metric value")
+        ax.grid(axis="y", alpha=0.3)
+
+        for i, (mean, std) in enumerate(zip(means, stds)):
+            ax.annotate(
+                f"{mean:.4f} ± {std:.4f}",
+                (i, mean + std),
+                xytext=(0, 5),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+            )
+
+        ax.margins(y=0.15)
+
+    plt.tight_layout()
+    plt.show()
+
+
 
 import torch
 
