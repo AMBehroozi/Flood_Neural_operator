@@ -138,7 +138,7 @@ This codebase provides the core implementation needed to train and evaluate the 
 
 The simulation datasets and pretrained model checkpoints associated with the paper **"Physically Anchored Multi-Resolution Neural Operator Framework for Flood Inundation Prediction"** are hosted separately on Zenodo due to their large file sizes.
 
-**Zenodo repository:** [Datasets and Trained Models](https://zenodo.org/deposit/23988604)
+**Zenodo repository:** [Datasets and Trained Models](https://zenodo.org/records/23990987)
 
 The repository contains two archives:
 
