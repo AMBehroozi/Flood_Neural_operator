@@ -1,5 +1,4 @@
 import torch
-
 import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib.dates as mdates
@@ -7,6 +6,592 @@ from datetime import datetime
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap, BoundaryNorm, LightSource
 from datetime import datetime, timedelta
+from matplotlib.ticker import FormatStrFormatter
+
+
+def eventwise_csi_for_violin(
+    Depth_True,
+    Depth_Pred,
+    wet_threshold=0.025,
+    eps=1e-12,
+):
+    """
+    Compute event-wise CSI for violin plots.
+
+    Depth_True, Depth_Pred: torch tensors [nbatch, nx, ny, nt]
+
+    Returns
+    -------
+    dict with:
+        "CSI": tensor [nbatch]
+    """
+
+    assert Depth_True.shape == Depth_Pred.shape, (
+        "True and predicted tensors must have the same shape."
+    )
+
+    assert Depth_True.ndim == 4, (
+        "Expected tensors with shape [nbatch, nx, ny, nt]."
+    )
+
+    nb = Depth_True.shape[0]
+    csi_all = []
+
+    for b in range(nb):
+        O = Depth_True[b]  # [nx, ny, nt]
+        P = Depth_Pred[b]
+
+        wet_O = O > wet_threshold
+        wet_P = P > wet_threshold
+
+        TP = torch.sum(wet_O & wet_P).float()
+        FP = torch.sum(~wet_O & wet_P).float()
+        FN = torch.sum(wet_O & ~wet_P).float()
+
+        csi = TP / (TP + FP + FN + eps)
+
+        csi_all.append(csi)
+
+    return {
+        "CSI": torch.stack(csi_all)  # [nbatch]
+    }
+
+
+def eventwise_relrmse_nse_for_violin(
+    Depth_True,
+    Depth_Pred,
+    eps=1e-12,
+):
+    """
+    Compute event-wise relRMSE and NSE for violin plots.
+
+    Inputs
+    ------
+    Depth_True, Depth_Pred : torch.Tensor
+        Shape [nbatch, nx, ny, nt]
+
+    Returns
+    -------
+    dict of tensors, each with shape [nbatch]
+    """
+
+    assert Depth_True.shape == Depth_Pred.shape, (
+        "True and predicted tensors must have the same shape."
+    )
+
+    assert Depth_True.ndim == 4, (
+        "Expected tensors with shape [nbatch, nx, ny, nt]."
+    )
+
+    nb = Depth_True.shape[0]
+
+    relrmse_all = []
+    nse_all = []
+
+    for b in range(nb):
+        O = Depth_True[b]  # [nx, ny, nt]
+        P = Depth_Pred[b]
+
+        diff = O - P
+
+        rmse = torch.sqrt(torch.mean(diff**2))
+        mean_O = torch.mean(O)
+
+        relrmse = rmse / (mean_O + eps)
+
+        nse = 1.0 - torch.sum(diff**2) / (
+            torch.sum((O - mean_O) ** 2) + eps
+        )
+
+        relrmse_all.append(relrmse)
+        nse_all.append(nse)
+
+    return {
+        "relRMSE": torch.stack(relrmse_all),  # [nbatch]
+        "NSE": torch.stack(nse_all),          # [nbatch]
+    }
+
+
+def plot_test_violin(
+    values,
+    metric_label="RMSE (m)",
+    title="RMSE (m) over test scenarios",
+    ylabel=None,
+    save_path=None,
+    ylim=None,
+    violin_x=1.25,  # shift violin to right
+    bbox_to_anchor=(0.02, 0.98),
+):
+    """
+    Plot a single violin plot for test values only.
+    """
+
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+
+    values = np.asarray(values, dtype=float).reshape(-1)
+    values = values[~np.isnan(values)]
+
+    if len(values) == 0:
+        raise ValueError("No valid values to plot.")
+
+    mean_val = np.mean(values)
+    median_val = np.median(values)
+    min_val = np.min(values)
+    max_val = np.max(values)
+    q25, q75 = np.percentile(values, [25, 75])
+
+    # -----------------------------
+    # Automatic y-axis limits
+    # -----------------------------
+    if ylim is None:
+        pad_frac = 0.10
+        data_range = max_val - min_val
+
+        if data_range == 0:
+            pad = pad_frac * abs(max_val) if abs(max_val) > 0 else 0.1
+        else:
+            pad = pad_frac * data_range
+
+        ylim = (min_val - pad, max_val + pad)
+
+    # -----------------------------
+    # Figure
+    # -----------------------------
+    fig, ax = plt.subplots(figsize=(3.5, 5.2))
+
+    parts = ax.violinplot(
+        [values],
+        positions=[violin_x],
+        widths=0.55,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+
+    for body in parts["bodies"]:
+        body.set_alpha(0.35)
+
+    # Interquartile range
+    ax.vlines(
+        violin_x,
+        q25,
+        q75,
+        linewidth=6,
+        alpha=0.55,
+        zorder=4,
+    )
+
+    # # Median
+    # ax.scatter(
+    #     violin_x,
+    #     median_val,
+    #     marker="o",
+    #     s=55,
+    #     edgecolor="black",
+    #     zorder=5,
+    #     label="Median",
+    # )
+
+    # Mean
+    ax.scatter(
+        violin_x,
+        mean_val,
+        marker="D",
+        s=80,
+        edgecolor="black",
+        zorder=6,
+        label="Mean",
+    )
+
+    # Min / mean / max guide lines
+    guide_vals = {
+        "max": max_val,
+        "mean": mean_val,
+        "min": min_val,
+    }
+
+    for name, val in guide_vals.items():
+        ax.hlines(
+            val,
+            violin_x + 0.12,
+            violin_x + 0.55,
+            linestyles="--",
+            linewidth=1.4,
+            alpha=0.8,
+        )
+        ax.text(
+            violin_x + 0.60,
+            val,
+            f"{val:.4f}",
+            va="center",
+            ha="left",
+            fontsize=14,
+        )
+
+    # Jittered points
+    jitter = np.random.normal(violin_x, 0.025, size=len(values))
+    ax.scatter(
+        jitter,
+        values,
+        s=14,
+        alpha=0.25,
+        edgecolor="none",
+        zorder=3,
+    )
+
+    ax.set_xticks([violin_x])
+    ax.set_xticklabels([""], fontsize=16)
+
+    ax.set_ylabel(
+        ylabel if ylabel is not None else metric_label,
+        fontsize=18,
+    )
+
+    # Wider x-range with free space on both sides
+    ax.set_xlim(0.45, 2.0)
+
+    ax.set_ylim(ylim)
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.4f"))
+
+    # Larger tick label numbers
+    ax.tick_params(axis="both", labelsize=12)
+
+    ax.grid(True, axis="y", alpha=0.25)
+
+    # ax.legend(
+    #     frameon=True,
+    #     loc="upper left",
+    #     bbox_to_anchor=bbox_to_anchor,
+    #     fontsize=16
+    # )
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+
+    plt.show()
+    return fig, ax
+
+
+def plot_test_violin_D(
+    fine_values,
+    coarse_values,
+    metric_label="RMSE (m)",
+    title="RMSE (m) over test scenarios",
+    ylabel=None,
+    save_path=None,
+    fine_ylim=None,
+    coarse_ylim=None,
+    bbox_to_anchor=(0.02, 0.98),
+    value_format="decimal",
+    decimals=5,
+):
+    """
+    Plot Fine and Coarse violin plots together with independent y-axes.
+
+    Fine   = left y-axis
+    Coarse = right y-axis
+    """
+
+    # -----------------------------
+    # Convert inputs
+    # -----------------------------
+    if isinstance(fine_values, torch.Tensor):
+        fine_values = fine_values.detach().cpu().numpy()
+
+    if isinstance(coarse_values, torch.Tensor):
+        coarse_values = coarse_values.detach().cpu().numpy()
+
+    fine_values = np.asarray(fine_values, dtype=float).reshape(-1)
+    coarse_values = np.asarray(coarse_values, dtype=float).reshape(-1)
+
+    fine_values = fine_values[~np.isnan(fine_values)]
+    coarse_values = coarse_values[~np.isnan(coarse_values)]
+
+    if len(fine_values) == 0:
+        raise ValueError("No valid fine values to plot.")
+
+    if len(coarse_values) == 0:
+        raise ValueError("No valid coarse values to plot.")
+
+    # -----------------------------
+    # Positions
+    # -----------------------------
+    fine_x = 0.5
+    coarse_x = 1.3
+
+    # -----------------------------
+    # Independent automatic y-limits
+    # -----------------------------
+    def get_ylim(values):
+        min_val = np.min(values)
+        max_val = np.max(values)
+
+        pad_frac = 0.10
+        data_range = max_val - min_val
+
+        if data_range == 0:
+            pad = pad_frac * abs(max_val) if abs(max_val) > 0 else 0.1
+        else:
+            pad = pad_frac * data_range
+
+        return min_val - pad, max_val + pad
+
+    if fine_ylim is None:
+        fine_ylim = get_ylim(fine_values)
+
+    if coarse_ylim is None:
+        coarse_ylim = get_ylim(coarse_values)
+
+    # -----------------------------
+    # Figure and two y-axes
+    # -----------------------------
+    fig, ax_fine = plt.subplots(figsize=(4.5, 5.2))
+    ax_coarse = ax_fine.twinx()
+
+    # -----------------------------
+    # Fine violin - LEFT axis
+    # -----------------------------
+    mean_val = np.mean(fine_values)
+    min_val = np.min(fine_values)
+    max_val = np.max(fine_values)
+    q25, q75 = np.percentile(fine_values, [25, 75])
+
+    parts = ax_fine.violinplot(
+        [fine_values],
+        positions=[fine_x],
+        widths=0.15,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+
+    for body in parts["bodies"]:
+        body.set_alpha(0.35)
+
+    ax_fine.vlines(
+        fine_x,
+        q25,
+        q75,
+        linewidth=6,
+        alpha=0.55,
+        zorder=4,
+    )
+
+    ax_fine.scatter(
+        fine_x,
+        mean_val,
+        marker="D",
+        s=80,
+        edgecolor="black",
+        zorder=6,
+    )
+
+
+
+
+    for val in [max_val, mean_val, min_val]:
+        ax_fine.hlines(
+            val,
+            fine_x + 0.12,
+            fine_x + 0.42,
+            linestyles="--",
+            linewidth=1.4,
+            alpha=0.8,
+        )
+
+        if value_format == "percent":
+            label = f"{val * 100:.{decimals}f}%"
+        elif value_format == "decimal":
+            label = f"{val:.{decimals}f}"
+        else:
+            label = str(val)
+
+
+        ax_fine.text(
+            fine_x + 0.12,
+            val,
+            f"\n{label}",
+            va="center",
+            ha="left",
+            fontsize=14,
+        )
+
+    jitter = np.random.normal(
+        fine_x,
+        0.025,
+        size=len(fine_values),
+    )
+
+    ax_fine.scatter(
+        jitter,
+        fine_values,
+        s=14,
+        alpha=0.25,
+        edgecolor="none",
+        zorder=3,
+    )
+
+    # -----------------------------
+    # Coarse violin - RIGHT axis
+    # -----------------------------
+    mean_val = np.mean(coarse_values)
+    min_val = np.min(coarse_values)
+    max_val = np.max(coarse_values)
+    q25, q75 = np.percentile(coarse_values, [25, 75])
+
+    parts = ax_coarse.violinplot(
+        [coarse_values],
+        positions=[coarse_x],
+        widths=0.15,
+        showmeans=False,
+        showmedians=False,
+        showextrema=False,
+    )
+
+    for body in parts["bodies"]:
+        body.set_alpha(0.35)
+
+    ax_coarse.vlines(
+        coarse_x,
+        q25,
+        q75,
+        linewidth=6,
+        alpha=0.55,
+        zorder=4,
+    )
+
+    ax_coarse.scatter(
+        coarse_x,
+        mean_val,
+        marker="D",
+        s=80,
+        edgecolor="black",
+        zorder=6,
+    )
+
+    for val in [max_val, mean_val, min_val]:
+        ax_coarse.hlines(
+            val,
+            coarse_x + 0.12,
+            coarse_x + 0.42,
+            linestyles="--",
+            linewidth=1.4,
+            alpha=0.8,
+        )
+
+        if value_format == "percent":
+            label = f"{val * 100:.{decimals}f}%"
+        elif value_format == "decimal":
+            label = f"{val:.{decimals}f}"
+        else:
+            label = str(val)
+
+
+        ax_coarse.text(
+            coarse_x + 0.12,
+            val,
+            f"\n{label}",
+            va="center",
+            ha="left",
+            fontsize=14,
+        )
+
+    jitter = np.random.normal(
+        coarse_x,
+        0.025,
+        size=len(coarse_values),
+    )
+
+    ax_coarse.scatter(
+        jitter,
+        coarse_values,
+        s=14,
+        alpha=0.25,
+        edgecolor="none",
+        zorder=3,
+    )
+
+    # -----------------------------
+    # X-axis
+    # -----------------------------
+    ax_fine.set_xticks([fine_x, coarse_x])
+    ax_fine.set_xticklabels(
+        ["Fine (FNO)", "Coarse (FNO)"],
+        fontsize=16,
+    )
+
+    ax_fine.set_xlim(0.35, 1.9)
+    ax_coarse.set_xlim(0.35, 1.9)
+
+    # -----------------------------
+    # Independent Y-axes
+    # -----------------------------
+    axis_label = ylabel if ylabel is not None else metric_label
+
+    ax_fine.set_ylabel(
+        f"{axis_label}",
+        fontsize=18,
+    )
+
+    # ax_coarse.set_ylabel(
+    #     f"Coarse {axis_label}",
+    #     fontsize=18,
+    # )
+
+    ax_fine.set_ylim(fine_ylim)
+    ax_coarse.set_ylim(coarse_ylim)
+
+    ax_fine.yaxis.set_major_formatter(
+        FormatStrFormatter("%.5f")
+    )
+
+    ax_coarse.yaxis.set_major_formatter(
+        FormatStrFormatter("%.5f")
+    )
+
+    # X-axis tick labels
+    ax_fine.tick_params(axis="x", labelsize=12)
+
+    # Hide y-axis tick numbers
+    ax_fine.tick_params(axis="y", labelleft=False)
+    ax_coarse.tick_params(axis="y", labelright=False)
+
+
+    # ax_fine.tick_params(
+    #     axis="both",
+    #     labelsize=12,
+    # )
+
+    # ax_coarse.tick_params(
+    #     axis="y",
+    #     labelsize=12,
+    # )
+
+    # Grid follows Fine / left axis
+    ax_fine.grid(
+        True,
+        axis="y",
+        alpha=0.25,
+    )
+
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(
+            save_path,
+            dpi=300,
+            bbox_inches="tight",
+        )
+
+    plt.show()
+    return fig, ax_fine
+
+
+
+
 
 def plot_ever_inundation_confusion(
     u_true,
@@ -258,78 +843,183 @@ def plot_ever_inundation_confusion(
 
 
 
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+from datetime import timedelta
+
+
 def plot_detection_skill_time(
     dynamic_metrics,
     start_datetime,
     end_datetime,
-    figsize=(6,4),
-    legend_loc=(0.95, 0.6)
+    figsize=(6, 4),
+    legend_loc=(0.95, 0.6),
+    time_unit="auto",
 ):
     """
-    Plot CSI, POD, and FAR over time with date axis.
+    Plot CSI, POD, and FAR over time.
+
+    Automatically selects hourly or daily x-axis formatting.
 
     Parameters
     ----------
     dynamic_metrics : dict
-        Should contain:
-            'CSI_t', 'POD_t', 'FAR_t'
+        Contains 'CSI_t', 'POD_t', and 'FAR_t'.
     start_datetime : datetime
-    end_datetime   : datetime
+        Start of the time period.
+    end_datetime : datetime
+        End of the time period.
     figsize : tuple
-        Figure size
+        Figure size.
     legend_loc : tuple
-        bbox_to_anchor location for legend
+        Legend anchor position.
+    time_unit : str
+        'auto', 'hourly', or 'daily'.
 
     Returns
     -------
     fig, ax
     """
 
-    # Convert to numpy safely (works for torch or numpy)
+    # ========================================================
+    # 1. PREPARE DATA
+    # ========================================================
+
     def to_numpy(x):
         if hasattr(x, "detach"):
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    CSI = to_numpy(dynamic_metrics['CSI_t']) * 100
-    POD = to_numpy(dynamic_metrics['POD_t']) * 100
-    FAR = to_numpy(dynamic_metrics['FAR_t']) * 100
+    CSI = to_numpy(dynamic_metrics["CSI_t"]) * 100
+    POD = to_numpy(dynamic_metrics["POD_t"]) * 100
+    FAR = to_numpy(dynamic_metrics["FAR_t"]) * 100
 
     nt = len(CSI)
 
-    # Create datetime axis
+    if nt == 0 or len(POD) != nt or len(FAR) != nt:
+        raise ValueError("CSI, POD, and FAR must have the same nonzero length.")
+
+    if end_datetime <= start_datetime:
+        raise ValueError("end_datetime must be after start_datetime.")
+
+    # ========================================================
+    # 2. CREATE TIME AXIS
+    # ========================================================
+
+    duration = end_datetime - start_datetime
+
     time_axis = np.linspace(
         mdates.date2num(start_datetime),
         mdates.date2num(end_datetime),
-        nt
+        nt,
     )
 
-    # Plot
+    if time_unit == "auto":
+        time_unit = "hourly" if duration <= timedelta(days=2) else "daily"
+
+    if time_unit not in ("hourly", "daily"):
+        raise ValueError("time_unit must be 'auto', 'hourly', or 'daily'.")
+
+    # ========================================================
+    # 3. PLOT METRICS
+    # ========================================================
+
     fig, ax = plt.subplots(figsize=figsize)
 
-    ax.plot_date(time_axis, CSI, '-', linewidth=2, label='CSI')
-    ax.plot_date(time_axis, POD, '-', linewidth=2, label='POD')
-    ax.fill_between(time_axis, FAR, alpha=0.4, color='red', label='FAR')
+    ax.plot(
+        time_axis, CSI,
+        linewidth=2,
+        label="CSI",
+    )
 
-    ax.set_ylabel('Detection Skill (%)')
+    ax.plot(
+        time_axis, POD,
+        linewidth=2,
+        label="POD",
+    )
+
+    ax.fill_between(
+        time_axis, FAR,
+        alpha=0.4,
+        color="red",
+        label="FAR",
+    )
+
+    ax.set_ylabel("Detection Skill (%)")
     ax.set_ylim(0, 100)
+    ax.set_xlim(start_datetime, end_datetime)
 
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b\n%Y'))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    # ========================================================
+    # 4. AUTOMATIC DATE FORMATTING
+    # ========================================================
 
-    ax.set_xlabel('Date')
+    if time_unit == "hourly":
+
+        total_hours = duration.total_seconds() / 3600
+
+        if total_hours <= 6:
+            hour_interval = 1
+        elif total_hours <= 12:
+            hour_interval = 2
+        elif total_hours <= 24:
+            hour_interval = 4
+        else:
+            hour_interval = 6
+
+        ax.xaxis.set_major_locator(
+            mdates.HourLocator(interval=hour_interval)
+        )
+
+        ax.xaxis.set_major_formatter(
+            mdates.DateFormatter("%d %b\n%H:%M")
+        )
+
+        ax.set_xlabel("Time")
+
+    else:
+
+        total_days = duration.total_seconds() / 86400
+        day_interval = max(1, int(np.ceil(total_days / 8)))
+
+        ax.xaxis.set_major_locator(
+            mdates.DayLocator(interval=day_interval)
+        )
+
+        ax.xaxis.set_major_formatter(
+            mdates.DateFormatter("%d %b\n%Y")
+        )
+
+        ax.set_xlabel("Date")
+
+    # ========================================================
+    # 5. FINAL FORMATTING
+    # ========================================================
+
     ax.grid(alpha=0.3)
 
-    ax.legend(bbox_to_anchor=legend_loc, ncol=3)
+    ax.legend(
+        bbox_to_anchor=legend_loc,
+        ncol=3,
+    )
 
-    fig.autofmt_xdate()
-    plt.tight_layout()
+    ax.tick_params(axis="x", labelsize=9, rotation=0)
+
+    fig.tight_layout()
 
     return fig, ax
 
 
 
 
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+from datetime import timedelta
 
 
 def plot_inundation_extent_time(
@@ -338,91 +1028,211 @@ def plot_inundation_extent_time(
     idx,
     start_datetime,
     end_datetime,
-    figsize=(6,4),
-    legend_loc=(0.95, 0.6)
+    figsize=(6, 4),
+    legend_loc=(0.95, 0.6),
+    time_unit="auto",
 ):
     """
-    Plot inundation extent and relative error over time.
+    Plot inundation extent and absolute relative error over time.
+
+    Automatically selects hourly or daily x-axis formatting.
 
     Parameters
     ----------
     extent_true : torch.Tensor or np.ndarray
-        Shape [nb, nt]
+        Shape [nb, nt].
     extent_pred : torch.Tensor or np.ndarray
-        Shape [nb, nt]
+        Shape [nb, nt].
     idx : int
-        Batch index to visualize
+        Batch index to visualize.
     start_datetime : datetime
-    end_datetime   : datetime
+        Start of the time period.
+    end_datetime : datetime
+        End of the time period.
     figsize : tuple
+        Figure size.
     legend_loc : tuple
+        Legend anchor position.
+    time_unit : str
+        'auto', 'hourly', or 'daily'.
 
     Returns
     -------
     fig, ax1, ax2
     """
 
-    # --- Safe conversion to numpy ---
+    # ========================================================
+    # 1. PREPARE DATA
+    # ========================================================
+
     def to_numpy(x):
         if hasattr(x, "detach"):
             return x.detach().cpu().numpy()
         return np.asarray(x)
 
-    true = to_numpy(extent_true)[idx] / 1e6  # km^2
-    pred = to_numpy(extent_pred)[idx] / 1e6  # km^2
+    true = to_numpy(extent_true)[idx] / 1e6  # km²
+    pred = to_numpy(extent_pred)[idx] / 1e6  # km²
 
     nt = len(true)
 
-    # Create datetime axis
+    if nt == 0 or len(pred) != nt:
+        raise ValueError(
+            "Reference and predicted extents must have the same nonzero length."
+        )
+
+    if end_datetime <= start_datetime:
+        raise ValueError(
+            "end_datetime must be after start_datetime."
+        )
+
+    # ========================================================
+    # 2. CREATE TIME AXIS
+    # ========================================================
+
+    duration = end_datetime - start_datetime
+
     time_axis = np.linspace(
         mdates.date2num(start_datetime),
         mdates.date2num(end_datetime),
-        nt
+        nt,
     )
 
-    rel_error = np.abs(pred - true) / (true + 1e-8) * 100
+    if time_unit == "auto":
+        time_unit = "hourly" if duration <= timedelta(days=2) else "daily"
 
-    # --- Plot ---
+    if time_unit not in ("hourly", "daily"):
+        raise ValueError(
+            "time_unit must be 'auto', 'hourly', or 'daily'."
+        )
+
+    # ========================================================
+    # 3. CALCULATE RELATIVE ERROR
+    # ========================================================
+
+    rel_error = (
+        np.abs(pred - true) / (true + 1e-8) * 100
+    )
+
+    # ========================================================
+    # 4. PLOT INUNDATION EXTENT
+    # ========================================================
+
     fig, ax1 = plt.subplots(figsize=figsize)
 
-    ax1.plot_date(time_axis, true, '-', color='black',
-                  linewidth=2, label='Reference')
-    ax1.plot_date(time_axis, pred, '-', color='tab:blue',
-                  linewidth=2, label='Predicted')
+    ax1.plot(
+        time_axis,
+        true,
+        color="black",
+        linewidth=2,
+        label="Reference",
+    )
 
-    ax1.set_ylabel('Inundation Extent (km$^2$)')
+    ax1.plot(
+        time_axis,
+        pred,
+        color="tab:blue",
+        linewidth=2,
+        label="Predicted",
+    )
+
+    ax1.set_ylabel("Inundation Extent (km$^2$)")
+
+    # ========================================================
+    # 5. PLOT RELATIVE ERROR (SECONDARY AXIS)
+    # ========================================================
 
     ax2 = ax1.twinx()
-    ax2.plot_date(time_axis, rel_error, '--',
-                  color='red', linewidth=2,
-                  label='Absolute Relative Error')
-    ax2.set_ylabel('Absolute Relative Error (%)')
 
-    ax1.set_xlabel('Date')
+    ax2.plot(
+        time_axis,
+        rel_error,
+        linestyle="--",
+        color="red",
+        linewidth=2,
+        label="Absolute Relative Error",
+    )
+
+    ax2.set_ylabel("Absolute Relative Error (%)")
+
+    # ========================================================
+    # 6. AUTOMATIC DATE FORMATTING
+    # ========================================================
+
+    ax1.set_xlim(start_datetime, end_datetime)
+
+    if time_unit == "hourly":
+
+        total_hours = duration.total_seconds() / 3600
+
+        if total_hours <= 6:
+            hour_interval = 1
+        elif total_hours <= 12:
+            hour_interval = 2
+        elif total_hours <= 24:
+            hour_interval = 4
+        else:
+            hour_interval = 6
+
+        ax1.xaxis.set_major_locator(
+            mdates.HourLocator(interval=hour_interval)
+        )
+
+        ax1.xaxis.set_major_formatter(
+            mdates.DateFormatter("%d %b\n%H:%M")
+        )
+
+        ax1.set_xlabel("Time")
+
+    else:
+
+        total_days = duration.total_seconds() / 86400
+        day_interval = max(1, int(np.ceil(total_days / 8)))
+
+        ax1.xaxis.set_major_locator(
+            mdates.DayLocator(interval=day_interval)
+        )
+
+        ax1.xaxis.set_major_formatter(
+            mdates.DateFormatter("%d %b\n%Y")
+        )
+
+        ax1.set_xlabel("Date")
+
+    # ========================================================
+    # 7. FINAL FORMATTING
+    # ========================================================
+
     ax1.grid(alpha=0.3)
 
-    # Date formatting
-    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d %b\n%Y'))
-    ax1.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax1.tick_params(
+        axis="x",
+        labelsize=9,
+        rotation=0,
+    )
 
     # Combined legend
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2,
-               bbox_to_anchor=legend_loc)
 
-    fig.autofmt_xdate()
-    plt.tight_layout()
+    ax1.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        bbox_to_anchor=legend_loc,
+    )
+
+    fig.tight_layout()
 
     return fig, ax1, ax2
 
+
+    
 
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-def plot_metrics(metrics, figsize=(15, 4)):
+def plot_metrics(metrics, figsize=(15, 4), plot=False):
 
     groups = {
         "Relative RMSE": [
@@ -476,10 +1286,10 @@ def plot_metrics(metrics, figsize=(15, 4)):
             )
 
         ax.margins(y=0.15)
-
-    plt.tight_layout()
-    plt.show()
-
+    if plot:
+        plt.tight_layout()  
+        plt.show()
+    return fig, axes
 
 
 import torch
