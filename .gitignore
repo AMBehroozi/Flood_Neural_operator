@@ -5,3 +5,6 @@ datasets/**/*.pt
 
 # Ignore saved model weights
 experiments/saved_model/*.pth
+datasets_3_chowilla_river.zip
+data_old
+.gitignore
