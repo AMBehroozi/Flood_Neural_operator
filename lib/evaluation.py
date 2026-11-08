@@ -590,7 +590,230 @@ def plot_test_violin_D(
     return fig, ax_fine
 
 
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
 
+from matplotlib.patches import Patch
+from matplotlib.colors import ListedColormap, BoundaryNorm, LightSource
+
+
+def plot_inundation_confusion_multi_res(
+    u_true_all_coarse,
+    u_pred_coarse_all,
+    u_true_all,
+    u_upscaled_final,
+    bed_topo_all,
+    sample_idx_coarse=20,
+    sample_idx_fine=1,
+    inund_th=0.01,
+    hill_azdeg=315,
+    hill_altdeg=45,
+    hill_vert_exag=3.0,
+    hill_dx=1.0,
+    hill_dy=1.0,
+    bed_alpha=1.0,
+    overlay_alpha=0.78,
+    display_extent=[0, 1, 0, 1],
+    figsize=(9, 6.5),
+):
+    """
+    Plot coarse and fine inundation confusion maps side by side,
+    using the same fine-resolution bed-topography hillshade.
+    """
+
+    # ============================================================
+    # 1. HELPERS
+    # ============================================================
+
+    def to_tensor(x):
+        if isinstance(x, torch.Tensor):
+            return x
+        return torch.as_tensor(np.asarray(x))
+
+    def get_single_bed(bed):
+        bed = to_tensor(bed)
+
+        if bed.ndim == 3:
+            # use the first / common fine bed exactly as-is
+            bed = bed[0]
+        elif bed.ndim != 2:
+            raise ValueError(
+                f"Unsupported bed shape {tuple(bed.shape)}. "
+                "Expected (nx, ny) or (N, nx, ny)."
+            )
+
+        return bed.detach().cpu().numpy()
+
+    def make_confusion_codes(u_true, u_pred, sample_idx, inund_th=0.01):
+        ut = to_tensor(u_true)
+        up = to_tensor(u_pred)
+
+        if ut.shape != up.shape:
+            raise ValueError(
+                f"Shape mismatch: true {tuple(ut.shape)} vs pred {tuple(up.shape)}"
+            )
+
+        if ut.ndim == 4:
+            ut = ut[sample_idx]
+            up = up[sample_idx]
+        elif ut.ndim != 3:
+            raise ValueError(
+                f"Unsupported input ndim {ut.ndim}. Expected 3 or 4."
+            )
+
+        true_max = torch.max(ut, dim=-1).values
+        pred_max = torch.max(up, dim=-1).values
+
+        true_wet = true_max > inund_th
+        pred_wet = pred_max > inund_th
+
+        tn = (~true_wet) & (~pred_wet)
+        fp = (~true_wet) & pred_wet
+        fn = true_wet & (~pred_wet)
+        tp = true_wet & pred_wet
+
+        codes = torch.zeros_like(true_wet, dtype=torch.uint8)
+        codes[fp] = 1
+        codes[fn] = 2
+        codes[tp] = 3
+
+        return codes.detach().cpu().numpy()
+
+    # ============================================================
+    # 2. MAKE ONE FINE HILLSHADE FOR BOTH PANELS
+    # ============================================================
+
+    bed_fine_exact = get_single_bed(bed_topo_all)
+
+    ls = LightSource(azdeg=hill_azdeg, altdeg=hill_altdeg)
+
+    hill = ls.hillshade(
+        bed_fine_exact,
+        vert_exag=hill_vert_exag,
+        dx=hill_dx,
+        dy=hill_dy,
+    )
+
+    # ============================================================
+    # 3. CONFUSION MAPS
+    # ============================================================
+
+    conf_coarse = make_confusion_codes(
+        u_true=u_true_all_coarse,
+        u_pred=u_pred_coarse_all,
+        sample_idx=sample_idx_coarse,
+        inund_th=inund_th,
+    )
+
+    conf_fine = make_confusion_codes(
+        u_true=u_true_all,
+        u_pred=u_upscaled_final,
+        sample_idx=sample_idx_fine,
+        inund_th=inund_th,
+    )
+
+    # ============================================================
+    # 4. COLORMAP
+    # ============================================================
+
+    cmap = ListedColormap([
+        "#d9d9d9",  # Correct dry
+        "#ff0000",  # False alarm
+        "#66d9ff",  # Missed flood
+        "#08306b",  # Correct wet
+    ])
+
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5], cmap.N)
+
+    legend_handles = [
+        Patch(facecolor="#d9d9d9", edgecolor="none", label="Correct dry"),
+        Patch(facecolor="#ff0000", edgecolor="none", label="False alarm"),
+        Patch(facecolor="#66d9ff", edgecolor="none", label="Missed flood"),
+        Patch(facecolor="#08306b", edgecolor="none", label="Correct wet"),
+    ]
+
+    # ============================================================
+    # 5. PLOT
+    # ============================================================
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=figsize,
+        gridspec_kw={"wspace": 0.03},
+    )
+
+    for ax, conf in zip(axes, [conf_coarse, conf_fine]):
+
+        # SAME fine-topo hillshade in both panels
+        ax.imshow(
+            hill.T,
+            extent=display_extent,
+            origin="lower",
+            cmap="gist_yarg",
+            vmin=0,
+            vmax=1,
+            alpha=bed_alpha,
+            interpolation="bilinear",
+            zorder=1,
+        )
+
+        # Confusion overlay stretched to the same display domain
+        ax.imshow(
+            conf.T,
+            extent=display_extent,
+            origin="lower",
+            cmap=cmap,
+            norm=norm,
+            interpolation="nearest",
+            alpha=overlay_alpha,
+            zorder=2,
+        )
+
+        ax.set_xlim(display_extent[0], display_extent[1])
+        ax.set_ylim(display_extent[2], display_extent[3])
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_title("")
+
+        ax.set_aspect("auto")
+        ax.set_box_aspect(9 / 12)
+
+        for spine in ax.spines.values():
+            spine.set_visible(True)
+            spine.set_color("0.35")
+            spine.set_linewidth(0.8)
+
+    # Single legend inside right panel
+    axes[1].legend(
+        handles=legend_handles,
+        loc="upper right",
+        bbox_to_anchor=(0.99, 0.99),
+        fontsize=9,
+        frameon=True,
+        facecolor="white",
+        edgecolor="0.8",
+        framealpha=0.95,
+        borderpad=0.35,
+        labelspacing=0.25,
+        handlelength=1.5,
+    )
+
+    fig.subplots_adjust(
+        left=0.01,
+        right=0.99,
+        top=0.99,
+        bottom=0.01,
+        wspace=0.03,
+    )
+
+    plt.show()
+
+    return fig, axes
 
 
 def plot_ever_inundation_confusion(
